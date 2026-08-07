@@ -174,16 +174,31 @@ def fetch_fastest_ai_response(prompt):
 
 def generate_ai_question(subject, chapter, level="EXTREME_HIGH"):
     scope_text = f"Chapter '{chapter}'" if chapter else f"Full Subject '{subject}' syllabus"
-    diff_prompt = (
-        "Analyze ICAI CA Foundation Study Modules, PYQs, RTPs, and MTPs deeply. "
-        "Generate an EXTREMELY HIGH DIFFICULTY level question. Focus on conceptual traps, "
-        "tricky calculations, multi-statement evaluation, or complex statutory exceptions."
-    ) if level == "EXTREME_HIGH" else "Generate a Moderate/Medium difficulty conceptual ICAI module question."
+    
+    if level == "EXTREME_HIGH":
+        diff_instruction = "Difficulty: EXTREME HIGH. Focus on conceptual traps, multi-statement evaluations, and complex ICAI module exceptions."
+    elif level == "HIGH":
+        diff_instruction = "Difficulty: HIGH. Focus on tricky ICAI exam-level standard logic and calculations."
+    else:
+        diff_instruction = "Difficulty: MEDIUM. Focus on fundamental ICAI module conceptual questions."
+
+    tag_instruction = ""
+    if subject in ["Quantitative Aptitude", "Economics"]:
+        tag_instruction = (
+            "IMPORTANT FOR THIS SUBJECT: Deeply analyze official ICAI CA Foundation Study Modules, PYQs (2018-2025), RTPs, and MTPs.\n"
+            "If this question or logic appeared in an actual ICAI PYQ, RTP, or MTP, specify the source tag strictly in the Tag line.\n"
+            "Format Tag line as: 'Tag: [ICAI PYQ Nov 2022]' or 'Tag: [ICAI RTP May 2023]' or 'Tag: [ICAI MTP Series 1 2024]'.\n"
+            "If no specific year applies, write 'Tag: [ICAI Module Standard]'.\n"
+        )
+    else:
+        tag_instruction = "Write 'Tag: None'\n"
 
     prompt = (
         f"Generate exactly 1 multiple-choice question for CA Foundation '{subject}', {scope_text}.\n"
-        f"Difficulty Level Mandate: {diff_prompt}\n"
+        f"{diff_instruction}\n"
+        f"{tag_instruction}\n"
         f"Format strictly as:\n"
+        f"Tag: [Source tag or None]\n"
         f"Q: [Question text]\n"
         f"O1: [Option 1]\n"
         f"O2: [Option 2]\n"
@@ -199,15 +214,21 @@ def generate_ai_question(subject, chapter, level="EXTREME_HIGH"):
 def parse_single_ai_output(text, subject):
     if not text:
         return {
+            "tag": "",
             "question": f"[{subject}] ICAI Standard Practice Question",
             "options": ["Option A", "Option B", "Option C", "Option D"],
             "correct": 0,
             "explanation": "Standard ICAI rule applies."
         }
     lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
-    q_text, o1, o2, o3, o4, correct_idx, explanation = "", "", "", "", "", 0, "ICAI module principle applies."
+    tag_text, q_text, o1, o2, o3, o4, correct_idx, explanation = "", "", "", "", "", "", 0, "ICAI module principle applies."
+    
     for line in lines:
-        if line.startswith("Q:"): q_text = line[2:].strip()
+        if line.startswith("Tag:"):
+            val = line[4:].strip()
+            if val and val.lower() != "none" and subject in ["Quantitative Aptitude", "Economics"]:
+                tag_text = val
+        elif line.startswith("Q:"): q_text = line[2:].strip()
         elif line.startswith("O1:"): o1 = line[3:].strip()
         elif line.startswith("O2:"): o2 = line[3:].strip()
         elif line.startswith("O3:"): o3 = line[3:].strip()
@@ -218,6 +239,7 @@ def parse_single_ai_output(text, subject):
         elif line.startswith("Explanation:"): explanation = line[12:].strip()
     
     return {
+        "tag": tag_text,
         "question": q_text or f"[{subject}] ICAI Exam Question",
         "options": [o1 or "A", o2 or "B", o3 or "C", o4 or "D"],
         "correct": max(0, min(correct_idx, 3)),
@@ -285,7 +307,15 @@ def run_quiz_session(target_chat_id, subject, chapter, count, timer, break_freq=
             send_message(target_chat_id, "🚀 **Break Over!** Resuming quiz...")
 
         q = generate_ai_question(subject, chapter, current_difficulty)
-        poll_res = send_poll(target_chat_id, f"Q{idx+1}/{count}: {q['question']}", q['options'], q['correct'], open_period=timer)
+        
+        # Display PYQ / RTP / MTP tag if available (For Quants & Eco)
+        question_header = f"Q{idx+1}/{count}"
+        if q["tag"]:
+            question_header += f" {q['tag']}"
+            
+        full_q_text = f"{question_header}: {q['question']}"
+        
+        poll_res = send_poll(target_chat_id, full_q_text, q['options'], q['correct'], open_period=timer)
         poll_id = poll_res.get("result", {}).get("poll", {}).get("id") if poll_res.get("ok") else None
         
         time.sleep(timer + 1)
@@ -335,7 +365,7 @@ def get_help_text():
         "📅 **AUTOMATED SCHEDULER WIZARD (DM ONLY)**\n"
         "• `/link_group <GroupID>` — Permanently link your group\n"
         "• `/schedule` — Step-by-Step Guided Scheduler Wizard\n"
-        "  *(Asks Subject, Chapter, Time Slots, Qs & Timer)*"
+        "  *(Asks Subject, Chapter, Level, Time Slots, Qs & Timer)*"
     )
 
 def handle_updates():
@@ -441,23 +471,24 @@ def handle_updates():
                                 schedule_wizard_state[user_id]["chapter"] = chap_val
                                 keyboard = {
                                     "inline_keyboard": [
-                                        [{"text": "09:00, 15:00, 21:00", "callback_data": "slot_preset_1"}],
-                                        [{"text": "10:00, 14:00, 18:00, 22:00", "callback_data": "slot_preset_2"}],
-                                        [{"text": "✍️ Enter Custom Slots", "callback_data": "slot_custom"}]
+                                        [{"text": "⚡ MEDIUM", "callback_data": "swiz_lvl_MEDIUM"}],
+                                        [{"text": "🔥 HIGH", "callback_data": "swiz_lvl_HIGH"}],
+                                        [{"text": "💀 EXTREME HIGH", "callback_data": "swiz_lvl_EXTREME_HIGH"}]
                                     ]
                                 }
-                                send_message(chat_id, f"✅ **Chapter set:** `{chap_val}`\n\n⏰ **Step 3:** Choose Daily Time Slots:", reply_markup=keyboard)
+                                send_message(chat_id, f"✅ **Chapter set:** `{chap_val}`\n\n🎯 **Step 3:** Select Difficulty Level:", reply_markup=keyboard)
                             else:
                                 chap_val = text.replace("/chapter", "").strip()
                                 if target_chat_id in quiz_builder_state:
                                     quiz_builder_state[target_chat_id]["chapter"] = chap_val
                                     keyboard = {
                                         "inline_keyboard": [
-                                            [{"text": "10 Qs", "callback_data": "cnt_10"}, {"text": "20 Qs", "callback_data": "cnt_20"}],
-                                            [{"text": "30 Qs", "callback_data": "cnt_30"}, {"text": "50 Qs", "callback_data": "cnt_50"}]
+                                            [{"text": "⚡ MEDIUM", "callback_data": "lvl_MEDIUM"}],
+                                            [{"text": "🔥 HIGH", "callback_data": "lvl_HIGH"}],
+                                            [{"text": "💀 EXTREME HIGH", "callback_data": "lvl_EXTREME_HIGH"}]
                                         ]
                                     }
-                                    send_message(target_chat_id, f"✅ **Chapter set:** `{chap_val}`\n\n🔢 **Step 3:** Select Question Count:", reply_markup=keyboard)
+                                    send_message(target_chat_id, f"✅ **Chapter set:** `{chap_val}`\n\n🎯 **Step 3:** Select Difficulty Level:", reply_markup=keyboard)
 
                         # PERMANENT LINK GROUP (DM ONLY)
                         elif text.startswith("/link_group"):
@@ -505,7 +536,7 @@ def handle_updates():
                                         [{"text": "30 Qs", "callback_data": "swiz_cnt_30"}, {"text": "50 Qs", "callback_data": "swiz_cnt_50"}]
                                     ]
                                 }
-                                send_message(chat_id, f"✅ **Slots Saved:** `{', '.join(slots_list)}`\n\n🔢 **Step 4:** Select Question Count per Quiz:", reply_markup=keyboard)
+                                send_message(chat_id, f"✅ **Slots Saved:** `{', '.join(slots_list)}`\n\n🔢 **Step 5:** Select Question Count per Quiz:", reply_markup=keyboard)
 
                     elif "callback_query" in result:
                         query = result["callback_query"]
@@ -549,11 +580,23 @@ def handle_updates():
                             quiz_builder_state[query_chat_id]["chapter"] = ""
                             keyboard = {
                                 "inline_keyboard": [
+                                    [{"text": "⚡ MEDIUM", "callback_data": "lvl_MEDIUM"}],
+                                    [{"text": "🔥 HIGH", "callback_data": "lvl_HIGH"}],
+                                    [{"text": "💀 EXTREME HIGH", "callback_data": "lvl_EXTREME_HIGH"}]
+                                ]
+                            }
+                            edit_message(query_chat_id, message_id, "🎯 **Step 3:** Select Difficulty Level:", reply_markup=keyboard)
+
+                        elif data_cb.startswith("lvl_"):
+                            lvl = data_cb.split("lvl_")[1]
+                            quiz_builder_state[query_chat_id]["level"] = lvl
+                            keyboard = {
+                                "inline_keyboard": [
                                     [{"text": "10 Qs", "callback_data": "cnt_10"}, {"text": "20 Qs", "callback_data": "cnt_20"}],
                                     [{"text": "30 Qs", "callback_data": "cnt_30"}, {"text": "50 Qs", "callback_data": "cnt_50"}]
                                 ]
                             }
-                            edit_message(query_chat_id, message_id, "🔢 **Step 3:** Select Question Count:", reply_markup=keyboard)
+                            edit_message(query_chat_id, message_id, f"✅ Difficulty Level set.\n\n🔢 **Step 4:** Select Question Count:", reply_markup=keyboard)
 
                         elif data_cb.startswith("cnt_"):
                             cnt = int(data_cb.split("_")[1])
@@ -565,7 +608,7 @@ def handle_updates():
                                     [{"text": "☕ Every 30 Qs (10 min)", "callback_data": "break_30_10"}]
                                 ]
                             }
-                            edit_message(query_chat_id, message_id, f"✅ Questions: **{cnt}**\n\n☕ **Step 4:** Select Break Setting:", reply_markup=keyboard)
+                            edit_message(query_chat_id, message_id, f"✅ Questions: **{cnt}**\n\n☕ **Step 5:** Select Break Setting:", reply_markup=keyboard)
 
                         elif data_cb == "break_none":
                             quiz_builder_state[query_chat_id]["break_freq"] = 0
@@ -576,7 +619,7 @@ def handle_updates():
                                     [{"text": "45s", "callback_data": "timer_45"}, {"text": "60s", "callback_data": "timer_60"}]
                                 ]
                             }
-                            edit_message(query_chat_id, message_id, "⚡ Mode: **Non-stop**\n\n⏱️ **Step 5:** Select Timer per question:", reply_markup=keyboard)
+                            edit_message(query_chat_id, message_id, "⚡ Mode: **Non-stop**\n\n⏱️ **Step 6:** Select Timer per question:", reply_markup=keyboard)
 
                         elif data_cb.startswith("timer_"):
                             tmr = int(data_cb.split("_")[1])
@@ -625,12 +668,24 @@ def handle_updates():
                             schedule_wizard_state[query_chat_id]["chapter"] = ""
                             keyboard = {
                                 "inline_keyboard": [
+                                    [{"text": "⚡ MEDIUM", "callback_data": "swiz_lvl_MEDIUM"}],
+                                    [{"text": "🔥 HIGH", "callback_data": "swiz_lvl_HIGH"}],
+                                    [{"text": "💀 EXTREME HIGH", "callback_data": "swiz_lvl_EXTREME_HIGH"}]
+                                ]
+                            }
+                            edit_message(query_chat_id, message_id, "🎯 **Step 3:** Select Difficulty Level:", reply_markup=keyboard)
+
+                        elif data_cb.startswith("swiz_lvl_"):
+                            lvl = data_cb.split("swiz_lvl_")[1]
+                            schedule_wizard_state[query_chat_id]["level"] = lvl
+                            keyboard = {
+                                "inline_keyboard": [
                                     [{"text": "09:00, 15:00, 21:00", "callback_data": "slot_preset_1"}],
                                     [{"text": "10:00, 14:00, 18:00, 22:00", "callback_data": "slot_preset_2"}],
                                     [{"text": "✍️ Custom Slots", "callback_data": "slot_custom"}]
                                 ]
                             }
-                            edit_message(query_chat_id, message_id, "⏰ **Step 3:** Choose Daily Time Slots:", reply_markup=keyboard)
+                            edit_message(query_chat_id, message_id, "⏰ **Step 4:** Choose Daily Time Slots:", reply_markup=keyboard)
 
                         elif data_cb == "slot_preset_1":
                             schedule_wizard_state[query_chat_id]["slots"] = ["09:00", "15:00", "21:00"]
@@ -640,7 +695,7 @@ def handle_updates():
                                     [{"text": "30 Qs", "callback_data": "swiz_cnt_30"}, {"text": "50 Qs", "callback_data": "swiz_cnt_50"}]
                                 ]
                             }
-                            edit_message(query_chat_id, message_id, "🔢 **Step 4:** Select Question Count:", reply_markup=keyboard)
+                            edit_message(query_chat_id, message_id, "🔢 **Step 5:** Select Question Count:", reply_markup=keyboard)
 
                         elif data_cb == "slot_preset_2":
                             schedule_wizard_state[query_chat_id]["slots"] = ["10:00", "14:00", "18:00", "22:00"]
@@ -650,7 +705,7 @@ def handle_updates():
                                     [{"text": "30 Qs", "callback_data": "swiz_cnt_30"}, {"text": "50 Qs", "callback_data": "swiz_cnt_50"}]
                                 ]
                             }
-                            edit_message(query_chat_id, message_id, "🔢 **Step 4:** Select Question Count:", reply_markup=keyboard)
+                            edit_message(query_chat_id, message_id, "🔢 **Step 5:** Select Question Count:", reply_markup=keyboard)
 
                         elif data_cb == "slot_custom":
                             edit_message(query_chat_id, message_id, "✍️ Send command for slots:\n`/slots 09:00, 13:00, 18:00, 21:00`")
@@ -664,7 +719,7 @@ def handle_updates():
                                     [{"text": "45s", "callback_data": "swiz_tmr_45"}, {"text": "60s", "callback_data": "swiz_tmr_60"}]
                                 ]
                             }
-                            edit_message(query_chat_id, message_id, f"✅ Questions: **{cnt}**\n\n⏱️ **Step 5:** Select Timer per Question:", reply_markup=keyboard)
+                            edit_message(query_chat_id, message_id, f"✅ Questions: **{cnt}**\n\n⏱️ **Step 6:** Select Timer per Question:", reply_markup=keyboard)
 
                         elif data_cb.startswith("swiz_tmr_"):
                             tmr = int(data_cb.split("swiz_tmr_")[1])
@@ -672,6 +727,7 @@ def handle_updates():
                             target_grp = st.get("group_id")
                             subj = st.get("subject", "Accounts")
                             chap = st.get("chapter", "")
+                            lvl = st.get("level", "EXTREME_HIGH")
                             slots = st.get("slots", ["09:00", "15:00", "21:00"])
                             cnt = st.get("count", 10)
 
@@ -689,7 +745,7 @@ def handle_updates():
                                         "chapter": chap,
                                         "count": cnt,
                                         "timer": tmr,
-                                        "level": "EXTREME_HIGH"
+                                        "level": lvl
                                     })
                                     added += 1
 
