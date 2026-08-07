@@ -24,7 +24,12 @@ active_poll_tracker = {}
 active_quiz_sessions = {}
 quiz_builder_state = {}
 
-FIXED_SLOTS = ["09:00", "12:00", "15:00", "18:00", "21:00"]
+# Permanent mapping: user_id -> linked_group_id
+user_linked_groups = {}
+# User custom slots mapping: user_id -> ["09:00", "12:00", ...]
+user_custom_slots = {}
+
+DEFAULT_SLOTS = ["09:00", "12:00", "15:00", "18:00", "21:00"]
 SUBJECTS_ROTATION = ["Accounts", "Business Laws", "Quantitative Aptitude", "Economics"]
 
 print("🦅 CA Vault Direct Execution Quiz Bot Starting...")
@@ -75,10 +80,21 @@ def pin_message(chat_id, message_id):
 def is_group_chat(chat_id):
     return str(chat_id).startswith("-")
 
-def is_user_admin_or_owner(user_id, chat_id=None):
+def is_user_admin_owner_or_anonymous(message):
+    user_id = message.get("from", {}).get("id", 0)
+    
+    # 1. Check if user is bot owner
     if user_id == OWNER_ID:
         return True
-    if chat_id and is_group_chat(chat_id):
+
+    # 2. Check if message is sent anonymously (Group Anonymous Admin)
+    if "sender_chat" in message:
+        return True
+
+    chat_id = message["chat"]["id"]
+    
+    # 3. Check group member role (Creator/Admin)
+    if is_group_chat(chat_id):
         try:
             res = requests.get(f"{BASE_URL}/getChatMember", params={"chat_id": chat_id, "user_id": user_id}, timeout=5)
             data = res.json()
@@ -288,7 +304,7 @@ def run_quiz_session(target_chat_id, subject, chapter, count, timer, break_freq=
     active_quiz_sessions[target_chat_id] = False
     send_message(target_chat_id, f"🎉 **Quiz Complete!**\nSubject: `{subject}` | Total Questions: `{count}`")
 
-# --- BACKGROUND SCHEDULER WORKER ---
+# --- BACKGROUND SCHEDULER ---
 
 def scheduler_background_worker():
     while True:
@@ -307,18 +323,18 @@ def get_help_text():
     return (
         "📖 **CA VAULT QUIZ BOT — MENU** 📖\n\n"
         "┌──────────────────────────────────────\n"
-        "│ 🎮 **BASIC COMMANDS**\n"
+        "│ 🎮 **GROUP COMMANDS**\n"
         "├──────────────────────────────────────\n"
-        "│ • `/quiz` : Start step-by-step Interactive Quiz setup\n"
-        "│ • `/stopquiz` : Stop an active quiz session (Admins)\n"
-        "│ • `/help` : View all features and commands list\n"
+        "│ • `/quiz` : Start quiz in group (Owner/Admin/Anonymous Admin)\n"
+        "│ • `/stopquiz` : Stop active quiz in group\n"
+        "│ • `/myid` : Get group ID\n"
         "└──────────────────────────────────────\n\n"
         "┌──────────────────────────────────────\n"
-        "│ 📅 **DM SCHEDULER (5 TIMES DAILY)**\n"
+        "│ 📅 **DM MANAGEMENT COMMANDS**\n"
         "├──────────────────────────────────────\n"
-        "│ • Send command in DM to schedule group quizzes\n"
-        "│ • `/schedule_daily GroupID | QsCount | TimerSec`\n"
-        "│   *Slots:* 9 AM, 12 PM, 3 PM, 6 PM, 9 PM daily\n"
+        "│ • `/link_group GroupID` : Permanent link group to DM\n"
+        "│ • `/set_slots HH:MM, HH:MM` : Manually set daily quiz slots\n"
+        "│ • `/schedule_slots QsCount | TimerSec` : Activate schedule\n"
         "└──────────────────────────────────────"
     )
 
@@ -358,28 +374,33 @@ def handle_updates():
                     if "message" in result:
                         message = result["message"]
                         chat_id = message["chat"]["id"]
-                        user_id = message["from"]["id"]
+                        user_id = message.get("from", {}).get("id", 0)
                         text = message.get("text", "").strip()
                         
                         if text.startswith("/start"):
-                            send_message(chat_id, "👋 **CA Vault Quiz Bot Active!**\n\nType `/help` to see all features and commands.")
+                            send_message(chat_id, "👋 **CA Vault Quiz Bot Active!**\n\nType `/help` to view all capabilities.")
                         
                         elif text.startswith("/help"):
                             send_message(chat_id, get_help_text())
 
+                        elif text.startswith("/myid"):
+                            send_message(chat_id, f"🆔 **Chat ID:** `{chat_id}`")
+
+                        # --- GROUP COMMAND: STOP QUIZ ---
                         elif text == "/stopquiz":
-                            if is_user_admin_or_owner(user_id, chat_id):
+                            if is_user_admin_owner_or_anonymous(message):
                                 if active_quiz_sessions.get(chat_id, False):
                                     active_quiz_sessions[chat_id] = False
-                                    send_message(chat_id, "🛑 Stopping quiz...")
+                                    send_message(chat_id, "🛑 Stopping active quiz session...")
                                 else:
-                                    send_message(chat_id, "⚠️ No active quiz.")
+                                    send_message(chat_id, "⚠️ No active quiz running in this chat.")
                             else:
                                 send_message(chat_id, "🔒 Permission Denied.")
 
+                        # --- GROUP COMMAND: START QUIZ ---
                         elif text == "/quiz":
-                            if is_group_chat(chat_id) and not is_user_admin_or_owner(user_id, chat_id):
-                                send_message(chat_id, "🔒 Permission Denied: Only admins can start quiz.")
+                            if is_group_chat(chat_id) and not is_user_admin_owner_or_anonymous(message):
+                                send_message(chat_id, "🔒 Permission Denied: Only Admins, Owner, or Anonymous Admins can start the quiz.")
                                 continue
                             
                             quiz_builder_state[chat_id] = {"subject": "Accounts", "chapter": "", "level": "EXTREME_HIGH", "break_freq": 0, "break_duration": 0}
@@ -393,30 +414,61 @@ def handle_updates():
                             }
                             send_message(chat_id, "🎯 **Step 1:** Select Subject:", reply_markup=keyboard)
 
-                        # --- DM-ONLY COMMAND: 5 TIMES DAILY QUIZ SCHEDULER ---
-                        elif text.startswith("/schedule_daily"):
+                        # --- DM COMMAND 1: PERMANENT LINK GROUP ---
+                        elif text.startswith("/link_group"):
                             if is_group_chat(chat_id):
-                                send_message(chat_id, "⚠️ Security Alert: Send this command in my **Direct Message (DM)** to schedule group quizzes!")
-                                continue
-
-                            if not is_user_admin_or_owner(user_id):
-                                send_message(chat_id, "🔒 Permission Denied: You are not authorized.")
+                                send_message(chat_id, "⚠️ Send this command in my **Direct Message (DM)** to link your group!")
                                 continue
 
                             try:
-                                parts = text.replace("/schedule_daily", "").split("|")
-                                target_group_id = int(parts[0].strip())
-                                cnt = int(parts[1].strip())
-                                tmr = int(parts[2].strip())
+                                target_group_id = int(text.replace("/link_group", "").strip())
+                                user_linked_groups[user_id] = target_group_id
+                                send_message(chat_id, f"✅ **Group Permanently Linked!**\nGroup ID: `{target_group_id}`\n\nAb aap DM se slots aur schedules manage kar sakte hain.")
+                            except Exception:
+                                send_message(chat_id, "⚠️ **Invalid Format!** Use: `/link_group -100123456789`")
 
+                        # --- DM COMMAND 2: MANUALLY SET CUSTOM SLOTS ---
+                        elif text.startswith("/set_slots"):
+                            if is_group_chat(chat_id):
+                                send_message(chat_id, "⚠️ Set slots from my **DM**.")
+                                continue
+
+                            try:
+                                slots_str = text.replace("/set_slots", "").strip()
+                                slots_list = [s.strip() for s in slots_str.split(",") if s.strip()]
+                                if not slots_list:
+                                    raise ValueError()
+                                
+                                user_custom_slots[user_id] = slots_list
+                                send_message(chat_id, f"✅ **Custom Slots Saved!**\nYour Slots: `{', '.join(slots_list)}`")
+                            except Exception:
+                                send_message(chat_id, "⚠️ **Format:** `/set_slots 09:00, 12:00, 15:00, 18:00, 21:00`")
+
+                        # --- DM COMMAND 3: ACTIVATE SCHEDULER WITH CUSTOM SLOTS ---
+                        elif text.startswith("/schedule_slots"):
+                            if is_group_chat(chat_id):
+                                send_message(chat_id, "⚠️ Execute scheduler commands in **DM**.")
+                                continue
+
+                            target_group_id = user_linked_groups.get(user_id)
+                            if not target_group_id:
+                                send_message(chat_id, "⚠️ **Pehle group link karo!**\nCommand: `/link_group <GroupID>`")
+                                continue
+
+                            try:
+                                parts = text.replace("/schedule_slots", "").split("|")
+                                cnt = int(parts[0].strip())
+                                tmr = int(parts[1].strip())
+
+                                slots = user_custom_slots.get(user_id, DEFAULT_SLOTS)
                                 today = datetime.now()
-                                scheduled_count = 0
+                                total_added = 0
 
                                 for day_offset in range(30):
                                     future_date = (today + timedelta(days=day_offset)).strftime("%Y-%m-%d")
-                                    for slot_idx, slot in enumerate(FIXED_SLOTS):
+                                    for s_idx, slot in enumerate(slots):
                                         full_dt = f"{future_date} {slot}"
-                                        rotated_subj = SUBJECTS_ROTATION[(day_offset + slot_idx) % 4]
+                                        rotated_subj = SUBJECTS_ROTATION[(day_offset + s_idx) % 4]
                                         
                                         scheduled_quizzes.append({
                                             "chat_id": target_group_id,
@@ -427,15 +479,16 @@ def handle_updates():
                                             "timer": tmr,
                                             "level": "EXTREME_HIGH"
                                         })
-                                        scheduled_count += 1
+                                        total_added += 1
 
-                                sched_msg = send_message(target_group_id, f"📅 **Daily 5-Slot Quiz Schedule Activated!**\n\n⏰ **Fixed Daily Slots:** `9:00 AM`, `12:00 PM`, `3:00 PM`, `6:00 PM`, `9:00 PM`\n🔢 **Qs/Quiz:** `{cnt}` | ⏱️ **Timer:** `{tmr}s`\n🔄 **Subjects:** Dynamic Rotation\n🔥 **Level:** EXTREME HIGH")
+                                slot_display = ", ".join(slots)
+                                sched_msg = send_message(target_group_id, f"📅 **Automated Daily Quiz Schedule Activated!**\n\n⏰ **Active Daily Slots:** `{slot_display}`\n🔢 **Questions/Quiz:** `{cnt}` | ⏱️ **Timer:** `{tmr}s`\n🔄 **Rotation:** Accounts ➔ Law ➔ Quants ➔ Economics")
                                 if sched_msg.get("ok"):
                                     pin_message(target_group_id, sched_msg["result"]["message_id"])
 
-                                send_message(chat_id, f"✅ Successfully scheduled **{scheduled_count}** quiz sessions across 30 days (5 times/day) for Group `{target_group_id}`!")
+                                send_message(chat_id, f"🎉 **{total_added} Quizzes Scheduled!**\nLinked Group: `{target_group_id}`\nSlots: `{slot_display}`")
                             except Exception:
-                                send_message(chat_id, "⚠️ **Invalid Format!**\nUse DM format:\n`/schedule_daily GroupID | QsCount | Timer`\n\n*Example:*\n`/schedule_daily -100123456789 | 10 | 30`")
+                                send_message(chat_id, "⚠️ **Format:** `/schedule_slots QsCount | TimerSec`\nExample: `/schedule_slots 10 | 30`")
 
                     elif "callback_query" in result:
                         query = result["callback_query"]
