@@ -1,0 +1,5 @@
+# Byte-compiled / env files
+__pycache__/
+*.pyc
+.env
+quiz.db
