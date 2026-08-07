@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # --- CONFIGURATION & API KEYS FROM RENDER ENV ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -24,6 +25,19 @@ active_quiz_sessions = {}
 quiz_builder_state = {}
 
 print("🦅 CA Vault Direct Execution Quiz Bot Starting...")
+
+# --- DUMMY WEB SERVER FOR RENDER FREE WEB SERVICE ---
+class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Telegram Bot is Live and Healthy!")
+
+def run_dummy_server():
+    port = int(os.getenv("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), SimpleHTTPRequestHandler)
+    print(f"🌐 Dummy Web Server listening on port {port}")
+    server.serve_forever()
 
 # --- TELEGRAM API HELPER FUNCTIONS ---
 
@@ -658,5 +672,9 @@ def handle_updates():
             time.sleep(2)
 
 if __name__ == "__main__":
+    # Start Dummy Web Server for Render Free Tier Web Service
+    threading.Thread(target=run_dummy_server, daemon=True).start()
+    
+    # Start Bot Tasks
     threading.Thread(target=scheduler_background_worker, daemon=True).start()
     handle_updates()
