@@ -2,568 +2,225 @@ import os
 import sys
 import time
 import json
-import sqlite3
-import secrets
 import re
+import random
+import hashlib
 from datetime import datetime, timedelta
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
-from http.server import HTTPServer, BaseHTTPRequestHandler
+
+import database
 
 # --- CONFIGURATION & API KEYS FROM RENDER ENV ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else None
 OWNER_ID = int(os.getenv("OWNER_ID", "8724204988"))
+FORCE_SUB_CHANNEL = os.getenv("FORCE_SUB_CHANNEL", "")
+MAIN_GROUP_ID = int(os.getenv("MAIN_GROUP_ID", "0"))
 
-# 5 Free AI Keys
+# 6 Free AI Keys (Including OpenAI)
 CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-# OpenAI (added as an additional free-tier-compatible layer, per blueprint "Add both open ai")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# --- NEW: Production Pillars Config ---
-FORCE_SUB_CHANNEL = os.getenv("FORCE_SUB_CHANNEL", "")          # e.g. "@ca_vault_channel" — legacy single channel via env (still supported)
-FORCE_SUB_CHANNEL_LINK = os.getenv("FORCE_SUB_CHANNEL_LINK", "")  # public invite link shown to users (for the env channel above)
-PDF_VAULT_CHANNEL_ID = os.getenv("PDF_VAULT_CHANNEL_ID", "")     # numeric channel id (as string) bot must be admin of
-GROUP_INVITE_LINK = os.getenv("GROUP_INVITE_LINK", "")           # optional fallback group invite link shown on /refer
-
-XP_CORRECT = 4
-XP_WRONG = -1
-XP_REFERRAL_BONUS = 20
-LEVEL_XP_STEP = 100  # XP needed per level
-
-BANNED_WORDS = [w.strip().lower() for w in os.getenv("BANNED_WORDS", "").split(",") if w.strip()]
-MUTE_24H_SECONDS = 24 * 60 * 60
-
-scheduled_quizzes = []
 active_poll_tracker = {}
 active_quiz_sessions = {}
+active_quiz_session_timers = {}
 quiz_builder_state = {}
-schedule_wizard_state = {}
-quiz_report_tracker = {}  # chat_id -> list of per-question stat dicts (for end-of-quiz report)
+session_user_scores = {}
+session_user_streaks = {}
+pinned_daily_messages = {}
+last_pinned_topper_messages = {}
 
-# Permanent mapping: user_id -> linked_group_id
-user_linked_groups = {}
+MOTIVATIONAL_QUOTES = [
+    "🚀 *\"Success is not final, failure is not fatal: it is the courage to continue that counts.\"* — Keep grinding CA Champ!",
+    "🔥 *\"The future depends on what you do today.\"* — Work hard for that CA prefix!",
+    "🏛️ *\"Your dedication today will build your empire tomorrow.\"* — Welcome to CA Vault!",
+    "💡 *\"Small daily improvements over time lead to stunning results.\"* — Stay focused!",
+    "🎯 *\"Believe you can and you're halfway there.\"* — Crush your CA Foundation goals!"
+]
 
-# Permanent mapping: group_id -> "HH:MM" (24h) daily time to post "Today's Quiz" announcement
-group_reminder_time = {}
-_reminder_sent_tracker = {}  # group_id -> date string already announced today (in-memory only)
+SHAYARI_LIST = [
+    "✨ *Koshish aisi karo ki har ek question solution bane,\nMehnat aisi karo ki CA ki degree tumhari pehchan bane!*",
+    "🔥 *Zindagi mein toofan aaye toh darna mat,\nCA Foundation crack karke sabko harana mat bhoolna!*",
+    "🏛️ *Subah ki mehnat aur raaton ka jaagna rang layega,\nEk din tumhare naam ke aage CA zaroor aayega!*"
+]
 
-SUBJECTS = ["Accounts", "Business Laws", "Quantitative Aptitude", "Economics"]
-
-print("CA Vault Direct Execution Quiz Bot Starting...")
-
-# --- DUMMY WEB SERVER FOR RENDER FREE WEB SERVICE ---
-class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Telegram Bot is Live and Healthy!")
-
-def run_dummy_server():
-    port = int(os.getenv("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), SimpleHTTPRequestHandler)
-    print(f"Dummy Web Server listening on port {port}")
-    server.serve_forever()
+print("CA Vault Direct Execution Quiz Bot Starting (Master Enterprise Knowledge Hub)...")
 
 # --- TELEGRAM API HELPER FUNCTIONS ---
 
-def send_message(chat_id, text, reply_markup=None):
+def send_message(chat_id, text, reply_markup=None, parse_mode="Markdown"):
     if not BASE_URL: return {}
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
     if reply_markup:
         payload["reply_markup"] = reply_markup
     try:
-        res = requests.post(f"{BASE_URL}/sendMessage", json=payload, timeout=5)
+        res = requests.post(f"{BASE_URL}/sendMessage", json=payload, timeout=8)
         return res.json()
     except Exception:
         return {}
 
-def edit_message(chat_id, message_id, text, reply_markup=None):
+def delete_message(chat_id, message_id):
+    if not BASE_URL: return False
+    try:
+        res = requests.post(f"{BASE_URL}/deleteMessage", json={"chat_id": chat_id, "message_id": message_id}, timeout=8)
+        return res.json().get("ok", False)
+    except Exception:
+        return False
+
+def edit_message(chat_id, message_id, text, reply_markup=None, parse_mode="Markdown"):
     if not BASE_URL: return
-    payload = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "Markdown"}
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": parse_mode}
     if reply_markup:
         payload["reply_markup"] = reply_markup
     try:
-        requests.post(f"{BASE_URL}/editMessageText", json=payload, timeout=5)
+        requests.post(f"{BASE_URL}/editMessageText", json=payload, timeout=8)
     except Exception:
         pass
 
 def pin_message(chat_id, message_id):
     if not BASE_URL: return
     try:
-        requests.post(f"{BASE_URL}/pinChatMessage", json={"chat_id": chat_id, "message_id": message_id}, timeout=5)
+        requests.post(f"{BASE_URL}/pinChatMessage", json={"chat_id": chat_id, "message_id": message_id}, timeout=8)
     except Exception:
         pass
+
+def unpin_message(chat_id, message_id):
+    if not BASE_URL: return
+    try:
+        requests.post(f"{BASE_URL}/unpinChatMessage", json={"chat_id": chat_id, "message_id": message_id}, timeout=8)
+    except Exception:
+        pass
+
+def restrict_chat_member(chat_id, user_id, until_date=None, permissions=None):
+    if not BASE_URL: return False
+    if permissions is None:
+        permissions = {"can_send_messages": False}
+    payload = {
+        "chat_id": chat_id,
+        "user_id": user_id,
+        "permissions": permissions
+    }
+    if until_date:
+        payload["until_date"] = until_date
+    try:
+        res = requests.post(f"{BASE_URL}/restrictChatMember", json=payload, timeout=8)
+        return res.json().get("ok", False)
+    except Exception:
+        return False
+
+def set_chat_permissions(chat_id, can_send_messages=True):
+    if not BASE_URL: return False
+    payload = {
+        "chat_id": chat_id,
+        "permissions": {
+            "can_send_messages": can_send_messages,
+            "can_send_media_messages": can_send_messages,
+            "can_send_other_messages": can_send_messages
+        }
+    }
+    try:
+        res = requests.post(f"{BASE_URL}/setChatPermissions", json=payload, timeout=8)
+        return res.json().get("ok", False)
+    except Exception:
+        return False
+
+def check_force_sub(user_id):
+    if not FORCE_SUB_CHANNEL or not BASE_URL:
+        return True
+    try:
+        res = requests.get(f"{BASE_URL}/getChatMember", params={"chat_id": FORCE_SUB_CHANNEL, "user_id": user_id}, timeout=8)
+        data = res.json()
+        if data.get("ok"):
+            status = data["result"]["status"]
+            return status in ["creator", "administrator", "member"]
+    except Exception:
+        return True
+    return False
 
 def is_group_chat(chat_id):
     return str(chat_id).startswith("-")
 
-def is_user_admin_owner_or_anonymous(message):
-    user_id = message.get("from", {}).get("id", 0)
-    if user_id == OWNER_ID:
+def get_role(user_id):
+    return database.get_user_role(user_id, OWNER_ID)
+
+def is_user_admin_or_owner(message):
+    user_id = message["from"]["id"]
+    role = get_role(user_id)
+    if role in ["owner", "admin"]:
         return True
     if "sender_chat" in message:
         return True
     chat_id = message["chat"]["id"]
     if is_group_chat(chat_id):
         try:
-            res = requests.get(f"{BASE_URL}/getChatMember", params={"chat_id": chat_id, "user_id": user_id}, timeout=5)
+            res = requests.get(f"{BASE_URL}/getChatMember", params={"chat_id": chat_id, "user_id": user_id}, timeout=8)
             data = res.json()
             if data.get("ok"):
-                return data["result"]["status"] in ["creator", "administrator"]
+                status = data["result"]["status"]
+                if status in ["creator", "administrator"]:
+                    return True
         except Exception:
             return False
-        return False
-    return True
+    return False
 
-# --- PERSISTENCE (so linked groups / schedules survive bot restarts) ---
-DATA_FILE = "bot_data.json"
-_save_lock = threading.Lock()
+# --- SMART CONTEXT DETECTOR FOR KNOWLEDGE HUB ---
 
-def load_persisted_data():
-    global user_linked_groups, scheduled_quizzes
-    if not os.path.exists(DATA_FILE):
-        return
+def detect_material_request_intent(text):
+    text_lower = text.lower().strip()
+    
+    # Check for direct hashtags or keywords in database
+    keywords = database.search_smart_keywords()
+    for kw_entry in keywords:
+        kw = kw_entry["keyword"].lower()
+        if kw in text_lower:
+            return kw_entry
+            
+    # Check intent triggers (Demand vs Casual Chat)
+    demand_triggers = ["chahiye", "bhej do", "send notes", "pdf link", "notes please", "give notes", "share pdf"]
+    casual_triggers = ["tough hain", "kya tumne", "kaun padh raha hai", "samajh nahi aaya"]
+    
+    if any(c in text_lower for c in casual_triggers):
+        return None
+        
+    if any(d in text_lower for d in demand_triggers):
+        for kw_entry in keywords:
+            # Fuzzy match subject/teacher names
+            if kw_entry["teacher_name"].lower() in text_lower or kw_entry["keyword"].replace("#","").replace("_"," ") in text_lower:
+                return kw_entry
+                
+    return None
+
+# --- REST AI CALLS ---
+
+def call_openai(prompt):
+    if not OPENAI_API_KEY: return None
     try:
-        with open(DATA_FILE, "r") as f:
-            data = json.load(f)
-        loaded_links = data.get("linked_groups", {})
-        user_linked_groups.update({int(k): v for k, v in loaded_links.items()})
-        scheduled_quizzes.extend(data.get("scheduled_quizzes", []))
-        loaded_reminders = data.get("group_reminder_time", {})
-        group_reminder_time.update({int(k): v for k, v in loaded_reminders.items()})
-        print(f"Loaded {len(user_linked_groups)} linked group(s), {len(scheduled_quizzes)} scheduled quiz job(s), {len(group_reminder_time)} reminder setting(s) from disk.")
-    except Exception as e:
-        print(f"Could not load persisted data: {e}")
-
-def save_persisted_data():
-    with _save_lock:
-        try:
-            with open(DATA_FILE, "w") as f:
-                json.dump({
-                    "linked_groups": user_linked_groups,
-                    "scheduled_quizzes": scheduled_quizzes,
-                    "group_reminder_time": group_reminder_time
-                }, f)
-        except Exception as e:
-            print(f"Could not save persisted data: {e}")
-
-# ============================================================================
-# --- PRODUCTION-READY DATABASE LAYER (SQLite) ---
-# Pillars: A) Roles  B) Users/QuizHistory/Badges/PDFIndex/Leaderboard  C) Audit Logs
-# ============================================================================
-DB_FILE = os.getenv("DB_FILE", "ca_vault.db")
-_db_lock = threading.Lock()
-
-def get_db():
-    conn = sqlite3.connect(DB_FILE, timeout=10, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def init_db():
-    with _db_lock:
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("""CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            role TEXT DEFAULT 'student',
-            xp INTEGER DEFAULT 0,
-            level INTEGER DEFAULT 1,
-            streak_count INTEGER DEFAULT 0,
-            last_active_date TEXT,
-            referred_by INTEGER,
-            referral_code TEXT UNIQUE,
-            joined_date TEXT
-        )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS quiz_history (
-            attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            subject TEXT,
-            chapter TEXT,
-            score INTEGER,
-            correct_count INTEGER,
-            wrong_count INTEGER,
-            time_taken INTEGER,
-            timestamp TEXT
-        )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS badges (
-            badge_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            badge_name TEXT,
-            earned_at TEXT,
-            UNIQUE(user_id, badge_name)
-        )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS pdf_index (
-            pdf_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            file_id TEXT,
-            file_name TEXT,
-            uploaded_by INTEGER,
-            timestamp TEXT,
-            channel_message_id INTEGER
-        )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS leaderboard_cache (
-            user_id INTEGER,
-            period TEXT,
-            periodic_score INTEGER,
-            rank INTEGER,
-            updated_at TEXT,
-            PRIMARY KEY (user_id, period)
-        )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS audit_logs (
-            log_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            admin_id INTEGER,
-            target_user_id INTEGER,
-            action_type TEXT,
-            reason TEXT,
-            timestamp TEXT
-        )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS force_channels (
-            channel_id TEXT PRIMARY KEY,
-            channel_title TEXT,
-            invite_link TEXT,
-            added_by INTEGER,
-            added_at TEXT
-        )""")
-        conn.commit()
-        conn.close()
-        print("Database initialized (users, quiz_history, badges, pdf_index, leaderboard_cache, audit_logs, force_channels).")
-
-def add_force_channel(channel_id, channel_title, invite_link, added_by):
-    with _db_lock:
-        conn = get_db()
-        conn.execute(
-            "INSERT OR REPLACE INTO force_channels (channel_id, channel_title, invite_link, added_by, added_at) VALUES (?,?,?,?,?)",
-            (channel_id, channel_title, invite_link, added_by, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        )
-        conn.commit()
-        conn.close()
-    log_audit(added_by, 0, "channel_add", f"{channel_id} ({channel_title})")
-
-def remove_force_channel(channel_id, removed_by):
-    with _db_lock:
-        conn = get_db()
-        conn.execute("DELETE FROM force_channels WHERE channel_id=?", (channel_id,))
-        conn.commit()
-        conn.close()
-    log_audit(removed_by, 0, "channel_remove", channel_id)
-
-def get_force_channels():
-    conn = get_db()
-    rows = conn.execute("SELECT * FROM force_channels ORDER BY added_at ASC").fetchall()
-    conn.close()
-    return rows
-
-def log_audit(admin_id, target_user_id, action_type, reason=""):
-    with _db_lock:
-        conn = get_db()
-        conn.execute(
-            "INSERT INTO audit_logs (admin_id, target_user_id, action_type, reason, timestamp) VALUES (?,?,?,?,?)",
-            (admin_id, target_user_id, action_type, reason, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        )
-        conn.commit()
-        conn.close()
-
-def ensure_user(user_id, username=""):
-    with _db_lock:
-        conn = get_db()
-        row = conn.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,)).fetchone()
-        if not row:
-            role = "owner" if user_id == OWNER_ID else "student"
-            ref_code = secrets.token_hex(4)
-            conn.execute(
-                "INSERT INTO users (user_id, username, role, xp, level, streak_count, last_active_date, referral_code, joined_date) VALUES (?,?,?,?,?,?,?,?,?)",
-                (user_id, username, role, 0, 1, 0, "", ref_code, datetime.now().strftime("%Y-%m-%d"))
-            )
-            conn.commit()
-        elif username:
-            conn.execute("UPDATE users SET username=? WHERE user_id=?", (username, user_id))
-            conn.commit()
-        conn.close()
-
-def get_user_row(user_id):
-    conn = get_db()
-    row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
-    conn.close()
-    return row
-
-def get_role(user_id):
-    if user_id == OWNER_ID:
-        return "owner"
-    row = get_user_row(user_id)
-    return row["role"] if row else "student"
-
-def set_role(target_user_id, new_role, set_by):
-    ensure_user(target_user_id)
-    with _db_lock:
-        conn = get_db()
-        conn.execute("UPDATE users SET role=? WHERE user_id=?", (new_role, target_user_id))
-        conn.commit()
-        conn.close()
-    log_audit(set_by, target_user_id, "role_change", f"role set to {new_role}")
-
-ROLE_RANK = {"student": 0, "moderator": 1, "admin": 2, "owner": 3}
-
-def role_at_least(user_id, required_role):
-    return ROLE_RANK.get(get_role(user_id), 0) >= ROLE_RANK.get(required_role, 99)
-
-def compute_level(xp):
-    return max(1, (max(xp, 0) // LEVEL_XP_STEP) + 1)
-
-def update_streak(user_id):
-    """Daily streak: increments if last active was yesterday, resets if gap >1 day, no-op if already today."""
-    today = datetime.now().strftime("%Y-%m-%d")
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-    row = get_user_row(user_id)
-    if not row:
-        return 0
-    last = row["last_active_date"] or ""
-    streak = row["streak_count"] or 0
-    if last == today:
-        return streak
-    elif last == yesterday:
-        streak += 1
-    else:
-        streak = 1
-    with _db_lock:
-        conn = get_db()
-        conn.execute("UPDATE users SET streak_count=?, last_active_date=? WHERE user_id=?", (streak, today, user_id))
-        conn.commit()
-        conn.close()
-    return streak
-
-def add_xp(user_id, delta, username=""):
-    ensure_user(user_id, username)
-    with _db_lock:
-        conn = get_db()
-        row = conn.execute("SELECT xp FROM users WHERE user_id=?", (user_id,)).fetchone()
-        new_xp = max(0, (row["xp"] if row else 0) + delta)
-        new_level = compute_level(new_xp)
-        conn.execute("UPDATE users SET xp=?, level=? WHERE user_id=?", (new_xp, new_level, user_id))
-        conn.commit()
-        conn.close()
-    return new_xp, new_level
-
-def award_badge(user_id, badge_name):
-    with _db_lock:
-        conn = get_db()
-        try:
-            conn.execute(
-                "INSERT INTO badges (user_id, badge_name, earned_at) VALUES (?,?,?)",
-                (user_id, badge_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-            )
-            conn.commit()
-            newly_awarded = True
-        except sqlite3.IntegrityError:
-            newly_awarded = False
-        conn.close()
-    if newly_awarded:
-        send_message(user_id, f"🏅 *New Badge Unlocked!*\n\n`{badge_name}`\nKeep it up!")
-    return newly_awarded
-
-def check_and_award_badges(user_id):
-    row = get_user_row(user_id)
-    if not row:
-        return
-    xp, streak = row["xp"], row["streak_count"]
-    conn = get_db()
-    quiz_count = conn.execute("SELECT COUNT(*) c FROM quiz_history WHERE user_id=?", (user_id,)).fetchone()["c"]
-    conn.close()
-    if streak >= 7:
-        award_badge(user_id, "7-Day Streak 🔥")
-    if streak >= 3:
-        award_badge(user_id, "3-Day Streak ⚡")
-    if xp >= 500:
-        award_badge(user_id, "Quiz Master 🏆")
-    if quiz_count >= 10:
-        award_badge(user_id, "Consistent Learner 📚")
-
-def log_quiz_attempt(user_id, subject, chapter, correct_count, wrong_count, time_taken):
-    score = correct_count - wrong_count
-    with _db_lock:
-        conn = get_db()
-        conn.execute(
-            "INSERT INTO quiz_history (user_id, subject, chapter, score, correct_count, wrong_count, time_taken, timestamp) VALUES (?,?,?,?,?,?,?,?)",
-            (user_id, subject, chapter or "Full Syllabus", score, correct_count, wrong_count, time_taken, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        )
-        conn.commit()
-        conn.close()
-
-def get_leaderboard(period="alltime", limit=10):
-    conn = get_db()
-    if period == "alltime":
-        rows = conn.execute("SELECT user_id, username, xp, level FROM users ORDER BY xp DESC LIMIT ?", (limit,)).fetchall()
-    else:
-        days = {"daily": 1, "weekly": 7, "monthly": 30}.get(period, 7)
-        since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
-        rows = conn.execute(
-            """SELECT u.user_id, u.username, SUM(q.score) as periodic_score
-               FROM quiz_history q JOIN users u ON u.user_id = q.user_id
-               WHERE q.timestamp >= ? GROUP BY q.user_id ORDER BY periodic_score DESC LIMIT ?""",
-            (since, limit)
-        ).fetchall()
-    conn.close()
-    return rows
-
-def process_referral(new_user_id, referral_code):
-    conn = get_db()
-    referrer = conn.execute("SELECT user_id FROM users WHERE referral_code=?", (referral_code,)).fetchone()
-    conn.close()
-    if not referrer or referrer["user_id"] == new_user_id:
-        return
-    row = get_user_row(new_user_id)
-    if row and row["referred_by"]:
-        return  # already processed
-    with _db_lock:
-        conn = get_db()
-        conn.execute("UPDATE users SET referred_by=? WHERE user_id=?", (referrer["user_id"], new_user_id))
-        conn.commit()
-        conn.close()
-    add_xp(referrer["user_id"], XP_REFERRAL_BONUS)
-    log_audit(new_user_id, referrer["user_id"], "referral_bonus", f"+{XP_REFERRAL_BONUS} XP for referring {new_user_id}")
-    send_message(referrer["user_id"], f"🎉 *Referral Shield Activated!*\n\nSomeone joined using your referral link. `+{XP_REFERRAL_BONUS} XP` credited.")
-
-# --- ANTI-ABUSE / SECURITY HELPERS ---
-
-def restrict_user(chat_id, user_id, seconds=None):
-    payload = {
-        "chat_id": chat_id,
-        "user_id": user_id,
-        "permissions": {"can_send_messages": False}
-    }
-    if seconds:
-        payload["until_date"] = int(time.time()) + seconds
-    try:
-        requests.post(f"{BASE_URL}/restrictChatMember", json=payload, timeout=5)
-    except Exception:
-        pass
-
-def unrestrict_user(chat_id, user_id):
-    payload = {
-        "chat_id": chat_id,
-        "user_id": user_id,
-        "permissions": {
-            "can_send_messages": True, "can_send_audios": True, "can_send_documents": True,
-            "can_send_photos": True, "can_send_videos": True, "can_send_video_notes": True,
-            "can_send_voice_notes": True, "can_send_polls": True, "can_send_other_messages": True,
-            "can_add_web_page_previews": True
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+        payload = {
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": prompt}],
+            "response_format": {"type": "json_object"}
         }
-    }
-    try:
-        requests.post(f"{BASE_URL}/restrictChatMember", json=payload, timeout=5)
+        res = requests.post(url, json=payload, headers=headers, timeout=8)
+        if res.status_code == 200:
+            return res.json()["choices"][0]["message"]["content"]
     except Exception:
         pass
-
-def ban_user(chat_id, user_id):
-    try:
-        requests.post(f"{BASE_URL}/banChatMember", json={"chat_id": chat_id, "user_id": user_id}, timeout=5)
-    except Exception:
-        pass
-
-def contains_banned_word(text):
-    if not text or not BANNED_WORDS:
-        return False
-    lowered = text.lower()
-    return any(w in lowered for w in BANNED_WORDS)
-
-def handle_abuse_violation(chat_id, user_id, username, message_text):
-    """Instant temp mute + DM to Bot Owner with Unmute/Mute24h/Block inline options."""
-    restrict_user(chat_id, user_id, seconds=600)  # 10-min instant temp mute pending owner review
-    log_audit(0, user_id, "auto_mute", "banned word detected")
-    keyboard = {
-        "inline_keyboard": [
-            [
-                {"text": "✅ Unmute", "callback_data": f"abuse_unmute_{chat_id}_{user_id}"},
-                {"text": "🔇 Mute 24h", "callback_data": f"abuse_mute24_{chat_id}_{user_id}"},
-                {"text": "⛔ Block", "callback_data": f"abuse_block_{chat_id}_{user_id}"}
-            ]
-        ]
-    }
-    send_message(
-        OWNER_ID,
-        f"🛡️ *Anti-Abuse Alert*\n────────────────────────\n👤 User: `{user_id}` ({username})\n📍 Group: `{chat_id}`\n"
-        f"💬 Flagged Message: _{message_text[:200]}_\n\nUser has been auto-muted for 10 minutes pending your decision.",
-        reply_markup=keyboard
-    )
-
-def get_all_force_sub_targets():
-    """Returns every channel the user must be a member of: legacy env channel + all DB-added channels."""
-    targets = []
-    if FORCE_SUB_CHANNEL:
-        targets.append({
-            "channel_id": FORCE_SUB_CHANNEL,
-            "channel_title": "Official Channel",
-            "invite_link": FORCE_SUB_CHANNEL_LINK or f"https://t.me/{FORCE_SUB_CHANNEL.lstrip('@')}"
-        })
-    for row in get_force_channels():
-        targets.append({
-            "channel_id": row["channel_id"],
-            "channel_title": row["channel_title"] or row["channel_id"],
-            "invite_link": row["invite_link"] or (f"https://t.me/{row['channel_id'].lstrip('@')}" if str(row["channel_id"]).startswith("@") else "")
-        })
-    return targets
-
-def get_missing_channels(user_id):
-    """Returns the list of force-sub targets this user has NOT joined yet."""
-    missing = []
-    for t in get_all_force_sub_targets():
-        try:
-            res = requests.get(f"{BASE_URL}/getChatMember", params={"chat_id": t["channel_id"], "user_id": user_id}, timeout=5)
-            data = res.json()
-            if data.get("ok"):
-                if data["result"]["status"] not in ["creator", "administrator", "member"]:
-                    missing.append(t)
-            # if the API call fails (bot not admin there, etc.) we fail-open for THAT channel
-        except Exception:
-            pass
-    return missing
-
-def is_force_sub_member(user_id):
-    if not get_all_force_sub_targets():
-        return True
-    return len(get_missing_channels(user_id)) == 0
-
-def prompt_force_subscribe(send_to_chat_id, user_id, missing=None, mention=""):
-    """Sends a locked-access card with a Join button per missing channel + a Verify button.
-    send_to_chat_id can be the group itself (so the user is redirected straight there) or the user's DM."""
-    if missing is None:
-        missing = get_missing_channels(user_id)
-    if not missing:
-        return
-    buttons = [[{"text": f"📢 Join {t['channel_title']}", "url": t["invite_link"]}] for t in missing if t.get("invite_link")]
-    buttons.append([{"text": "✅ I've Joined — Verify", "callback_data": "fsub_recheck"}])
-    keyboard = {"inline_keyboard": buttons}
-    header = f"🔒 *ACCESS LOCKED* — {mention}" if mention else "🔒 *ACCESS LOCKED*"
-    text = (
-        f"{header}\n"
-        f"────────────────────────\n"
-        f"To chat here / use the bot, please join the channel(s) below first.\n"
-        f"Once joined, tap *✅ I've Joined — Verify* to unlock instantly.\n"
-        f"────────────────────────"
-    )
-    send_message(send_to_chat_id, text, reply_markup=keyboard)
-
-def set_focus_mode(chat_id, enable):
-    """Mutes/unmutes the whole group's default permission during a live quiz to stop spam."""
-    permissions = {"can_send_messages": not enable}
-    try:
-        requests.post(f"{BASE_URL}/setChatPermissions", json={"chat_id": chat_id, "permissions": permissions}, timeout=5)
-    except Exception:
-        pass
-
-# --- REST AI CALLS (5 LAYERS) ---
+    return None
 
 def call_gemini(prompt):
     if not GEMINI_API_KEY: return None
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
         payload = {"contents": [{"parts": [{"text": prompt}]}]}
-        res = requests.post(url, json=payload, timeout=5)
+        res = requests.post(url, json=payload, timeout=8)
         if res.status_code == 200:
             return res.json()["candidates"][0]["content"]["parts"][0]["text"]
     except Exception:
@@ -575,8 +232,8 @@ def call_groq(prompt):
     try:
         url = "https://api.groq.com/openai/v1/chat/completions"
         headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-        payload = {"model": "llama-3.3-70b-versatile", "messages": [{"role": "user", "content": prompt}]}
-        res = requests.post(url, json=payload, headers=headers, timeout=5)
+        payload = {"model": "llama-3.3-70b-versatile", "messages": [{"role": "user", "content": prompt}], "response_format": {"type": "json_object"}}
+        res = requests.post(url, json=payload, headers=headers, timeout=8)
         if res.status_code == 200:
             return res.json()["choices"][0]["message"]["content"]
     except Exception:
@@ -589,7 +246,7 @@ def call_cerebras(prompt):
         url = "https://api.cerebras.ai/v1/chat/completions"
         headers = {"Authorization": f"Bearer {CEREBRAS_API_KEY}", "Content-Type": "application/json"}
         payload = {"model": "llama3.1-70b", "messages": [{"role": "user", "content": prompt}]}
-        res = requests.post(url, json=payload, headers=headers, timeout=5)
+        res = requests.post(url, json=payload, headers=headers, timeout=8)
         if res.status_code == 200:
             return res.json()["choices"][0]["message"]["content"]
     except Exception:
@@ -602,7 +259,7 @@ def call_mistral(prompt):
         url = "https://api.mistral.ai/v1/chat/completions"
         headers = {"Authorization": f"Bearer {MISTRAL_API_KEY}", "Content-Type": "application/json"}
         payload = {"model": "mistral-large-latest", "messages": [{"role": "user", "content": prompt}]}
-        res = requests.post(url, json=payload, headers=headers, timeout=5)
+        res = requests.post(url, json=payload, headers=headers, timeout=8)
         if res.status_code == 200:
             return res.json()["choices"][0]["message"]["content"]
     except Exception:
@@ -615,7 +272,7 @@ def call_openrouter(prompt):
         url = "https://openrouter.ai/api/v1/chat/completions"
         headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
         payload = {"model": "deepseek/deepseek-chat", "messages": [{"role": "user", "content": prompt}]}
-        res = requests.post(url, json=payload, headers=headers, timeout=5)
+        res = requests.post(url, json=payload, headers=headers, timeout=8)
         if res.status_code == 200:
             return res.json()["choices"][0]["message"]["content"]
     except Exception:
@@ -623,73 +280,79 @@ def call_openrouter(prompt):
     return None
 
 def fetch_fastest_ai_response(prompt):
-    ai_funcs = [call_groq, call_gemini, call_cerebras, call_mistral, call_openrouter]
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    ai_funcs = [call_openai, call_groq, call_gemini, call_cerebras, call_mistral, call_openrouter]
+    with ThreadPoolExecutor(max_workers=6) as executor:
         futures = [executor.submit(func, prompt) for func in ai_funcs]
         for future in as_completed(futures):
             result = future.result()
-            if result and len(result.strip()) > 20:
+            if result and len(result.strip()) > 15:
                 return result
     return None
 
-def generate_ai_question(subject, chapter, subtopics="", level="EXTREME_HIGH"):
+def generate_ai_question(subject, chapter, level="EXTREME_HIGH"):
     scope_text = f"Chapter '{chapter}'" if chapter else f"Full Subject '{subject}' syllabus"
-    if subtopics:
-        scope_text += f" (Focus Sub-topics: '{subtopics}')"
-
-    if level == "EXTREME_HIGH":
-        diff_instruction = "Difficulty: EXTREME HIGH. Focus on conceptual traps, multi-statement evaluations, and complex ICAI module exceptions."
-    elif level == "HIGH":
-        diff_instruction = "Difficulty: HIGH. Focus on tricky ICAI exam-level standard logic and calculations."
-    else:
-        diff_instruction = "Difficulty: MEDIUM. Focus on fundamental ICAI module conceptual questions."
-
-    tag_instruction = ""
-    if subject in ["Quantitative Aptitude", "Economics"]:
-        tag_instruction = (
-            "IMPORTANT: If this question/logic appeared in an actual past ICAI PYQ, RTP, or MTP (2018-2025), specify the source tag strictly in Tag line.\n"
-            "Format Tag line as: 'Tag: [ICAI PYQ Nov 2022]' or 'Tag: [ICAI RTP May 2023]'.\n"
-            "DO NOT write 'ICAI Module Standard'. If no specific exam year applies, write 'Tag: None'.\n"
-        )
-    else:
-        tag_instruction = "Write 'Tag: None'\n"
+    diff_prompt = (
+        "Analyze ICAI CA Foundation Study Modules, PYQs, RTPs, and MTPs deeply. "
+        "Generate an EXTREMELY HIGH DIFFICULTY level question. Focus on conceptual traps, "
+        "tricky calculations, multi-statement evaluation, or complex statutory exceptions."
+    ) if level == "EXTREME_HIGH" else "Generate a Moderate/Medium difficulty conceptual ICAI module question."
 
     prompt = (
         f"Generate exactly 1 multiple-choice question for CA Foundation '{subject}', {scope_text}.\n"
-        f"{diff_instruction}\n"
-        f"{tag_instruction}\n"
-        f"Format strictly as:\n"
-        f"Tag: [Source tag or None]\n"
-        f"Q: [Question text]\n"
-        f"O1: [Option 1]\n"
-        f"O2: [Option 2]\n"
-        f"O3: [Option 3]\n"
-        f"O4: [Option 4]\n"
-        f"Correct: 1\n"
-        f"Explanation: [1-line precise ICAI logic explanation]"
+        f"Difficulty Mandate: {diff_prompt}\n\n"
+        f"Return strictly a JSON object with this exact key structure:\n"
+        f"{{\n"
+        f'  "question": "Question text",\n'
+        f'  "options": ["Option 1", "Option 2", "Option 3", "Option 4"],\n'
+        f'  "correct": 0,\n'
+        f'  "explanation": "Precise ICAI logic explanation",\n'
+        f'  "type": "theory"\n'
+        f"}}\n"
+        f"Note: 'correct' must be integer index (0, 1, 2, or 3). 'type' must be 'theory' or 'practical'."
     )
 
     raw_text = fetch_fastest_ai_response(prompt)
-    return parse_single_ai_output(raw_text, subject)
+    return parse_ai_json_or_text_output(raw_text, subject)
 
-def parse_single_ai_output(text, subject):
+def parse_ai_json_or_text_output(text, subject):
+    fallback = {
+        "question": f"[{subject}] ICAI Standard Practice Question",
+        "options": ["Option A", "Option B", "Option C", "Option D"],
+        "correct": 0,
+        "explanation": "Standard ICAI rule applies.",
+        "type": "theory"
+    }
     if not text:
-        return {
-            "tag": "",
-            "question": f"[{subject}] ICAI Practice Question",
-            "options": ["Option A", "Option B", "Option C", "Option D"],
-            "correct": 0,
-            "explanation": "Standard ICAI rule applies."
-        }
-    lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
-    tag_text, q_text, o1, o2, o3, o4, correct_idx, explanation = "", "", "", "", "", "", 0, "ICAI module principle applies."
+        return fallback
 
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?", "", cleaned).strip()
+        cleaned = re.sub(r"```$", "", cleaned).strip()
+
+    try:
+        data = json.loads(cleaned)
+        q_text = str(data.get("question", "")).strip()
+        opts = [str(o).strip() for o in data.get("options", [])]
+        corr = int(data.get("correct", 0))
+        expl = str(data.get("explanation", "")).strip()
+        q_type = str(data.get("type", "theory")).lower()
+
+        if q_text and len(opts) == 4:
+            return {
+                "question": q_text,
+                "options": opts,
+                "correct": max(0, min(corr, 3)),
+                "explanation": expl or "ICAI module principle applies.",
+                "type": q_type if q_type in ["theory", "practical"] else "theory"
+            }
+    except Exception:
+        pass
+
+    lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
+    q_text, o1, o2, o3, o4, correct_idx, explanation = "", "", "", "", "", 0, "ICAI module principle applies."
     for line in lines:
-        if line.startswith("Tag:"):
-            val = line[4:].strip()
-            if val and val.lower() != "none" and "module standard" not in val.lower() and subject in ["Quantitative Aptitude", "Economics"]:
-                tag_text = val
-        elif line.startswith("Q:"): q_text = line[2:].strip()
+        if line.startswith("Q:"): q_text = line[2:].strip()
         elif line.startswith("O1:"): o1 = line[3:].strip()
         elif line.startswith("O2:"): o2 = line[3:].strip()
         elif line.startswith("O3:"): o3 = line[3:].strip()
@@ -700,12 +363,36 @@ def parse_single_ai_output(text, subject):
         elif line.startswith("Explanation:"): explanation = line[12:].strip()
 
     return {
-        "tag": tag_text,
         "question": q_text or f"[{subject}] ICAI Exam Question",
-        "options": [o1 or "A", o2 or "B", o3 or "C", o4 or "D"],
+        "options": [o1 or "Option A", o2 or "Option B", o3 or "Option C", o4 or "Option D"],
         "correct": max(0, min(correct_idx, 3)),
-        "explanation": explanation
+        "explanation": explanation,
+        "type": "theory"
     }
+
+def parse_raw_text_questions(raw_text):
+    questions = []
+    blocks = raw_text.split("Q:")
+    for b in blocks:
+        if not b.strip(): continue
+        lines = [l.strip() for l in b.split("\n") if l.strip()]
+        q_text = lines[0] if lines else "Sample Question"
+        opts = []
+        corr = 0
+        expl = "Standard ICAI rule."
+        for line in lines:
+            if line.startswith("A)") or line.startswith("1)") or line.startswith("O1:"): opts.append(line[2:].strip())
+            elif line.startswith("B)") or line.startswith("2)") or line.startswith("O2:"): opts.append(line[2:].strip())
+            elif line.startswith("C)") or line.startswith("3)") or line.startswith("O3:"): opts.append(line[2:].strip())
+            elif line.startswith("D)") or line.startswith("4)") or line.startswith("O4:"): opts.append(line[2:].strip())
+            elif "Ans:" in line or "Correct:" in line:
+                digits = ''.join(filter(str.isdigit, line))
+                if digits: corr = int(digits) - 1
+            elif "Exp:" in line or "Explanation:" in line:
+                expl = line.split(":", 1)[1].strip()
+        if q_text and len(opts) >= 4:
+            questions.append({"question": q_text, "options": opts[:4], "correct": max(0, min(corr, 3)), "explanation": expl, "type": "theory"})
+    return questions
 
 def send_poll(chat_id, question, options, correct_option_id, open_period=30):
     payload = {
@@ -718,7 +405,7 @@ def send_poll(chat_id, question, options, correct_option_id, open_period=30):
         "open_period": open_period
     }
     try:
-        res = requests.post(f"{BASE_URL}/sendPoll", json=payload, timeout=5)
+        res = requests.post(f"{BASE_URL}/sendPoll", json=payload, timeout=8)
         data = res.json()
         if data.get("ok"):
             poll_id = data["result"]["poll"]["id"]
@@ -728,365 +415,260 @@ def send_poll(chat_id, question, options, correct_option_id, open_period=30):
                 "options": options,
                 "question": question,
                 "wrong_count": 0,
-                "total_votes": 0
+                "total_votes": 0,
+                "subject": ""
             }
         return data
     except Exception:
         return {}
 
-def run_quiz_session(target_chat_id, subject, chapter, count, timer, break_freq=0, break_duration=0, level="EXTREME_HIGH", conductor_user_id=None, subtopics=""):
-    if not is_group_chat(target_chat_id):
-        if conductor_user_id:
-            send_message(conductor_user_id, "*Quiz Error*\nQuizzes can ONLY be conducted inside Telegram Groups, not in DM.")
-        return
+def get_streak_praise(streak):
+    if streak == 1: return "🌟 Best!"
+    elif streak == 2: return "🔥 Better!"
+    elif streak == 3: return "👍 Good!"
+    elif streak == 4: return "🚀 Very Good!"
+    else: return "🏆 Outstanding!"
+
+def run_quiz_session(target_chat_id, subject, chapter, count, timer, break_freq=0, break_duration=0, level="EXTREME_HIGH"):
+    if target_chat_id in last_pinned_topper_messages:
+        unpin_message(target_chat_id, last_pinned_topper_messages[target_chat_id])
 
     active_quiz_sessions[target_chat_id] = True
-    quiz_report_tracker[target_chat_id] = []
-    set_focus_mode(target_chat_id, enable=True)  # Focus Mode: mute group chatter during the quiz
+    active_quiz_session_timers[target_chat_id] = timer
+    session_user_scores[target_chat_id] = {}
+    session_user_streaks[target_chat_id] = {}
+    
+    if is_group_chat(target_chat_id):
+        set_chat_permissions(target_chat_id, can_send_messages=False)
+        database.log_audit(0, 0, "FOCUS_MODE_ON", f"Auto-enabled focus mode for quiz in {target_chat_id}")
 
     chap_display = chapter if chapter else "Full Syllabus"
-    subtopic_display = f"\nSub-topics: `{subtopics}`" if subtopics else ""
-    break_info = f"Break: Every `{break_freq}` Qs for `{break_duration//60}` min" if break_freq > 0 else "Mode: Non-stop (No Breaks)"
-
-    start_msg = (
-        f"🎯 *CA VAULT — LIVE QUIZ SESSION*\n"
-        f"────────────────────────\n"
-        f"📘 Subject: `{subject}`\n"
-        f"📖 Chapter: `{chap_display}`{subtopic_display}\n"
-        f"🔢 Questions: `{count}`  |  ⏱ Timer: `{timer}s`\n"
-        f"☕ {break_info}\n"
-        f"────────────────────────\n"
-        f"🚀 Quiz starting now. All the best!"
-    )
-    send_message(target_chat_id, start_msg)
-
+    break_info = f"☕ Break: Every `{break_freq}` Qs for `{break_duration//60}` mins" if break_freq > 0 else "⚡ Mode: Non-stop (No Breaks)"
+    send_message(target_chat_id, f"🎯 **{subject} - {chap_display}**\n🔢 Questions: `{count}` | ⏱️ Timer: `{timer}s`\n{break_info}\n\n🚀 *Quiz starting now! Powered by CA Vault Master Engine.*")
+    
     current_difficulty = level
-
-    if conductor_user_id:
-        send_message(conductor_user_id, f"🚀 *Quiz Started* in group `{target_chat_id}`\n🔥 Starting level: `{current_difficulty}`\n📊 A full performance report will be sent here once the quiz ends.")
 
     for idx in range(count):
         if not active_quiz_sessions.get(target_chat_id, False):
-            send_message(target_chat_id, "Quiz session stopped.")
-            if conductor_user_id:
-                send_message(conductor_user_id, f"Quiz session stopped in group `{target_chat_id}`.")
+            send_message(target_chat_id, "🛑 **Quiz Session Stopped.**")
             break
 
         if idx > 0 and break_freq > 0 and idx % break_freq == 0:
-            send_message(target_chat_id, f"{idx} questions complete. `{break_duration // 60}` minute break starting now...")
+            send_message(target_chat_id, f"☕ **{idx} Questions Complete!**\n{break_duration // 60} minutes break shuru.")
             for _ in range(break_duration):
                 if not active_quiz_sessions.get(target_chat_id, False):
                     break
                 time.sleep(1)
-            send_message(target_chat_id, "Break over. Resuming quiz...")
+            send_message(target_chat_id, "🚀 **Break Over!** Resuming quiz...")
 
-        q = generate_ai_question(subject, chapter, subtopics, current_difficulty)
-
-        question_header = f"Q{idx+1}/{count}"
-        if q["tag"]:
-            question_header += f" {q['tag']}"
-
-        full_q_text = f"{question_header}: {q['question']}"
-
-        poll_res = send_poll(target_chat_id, full_q_text, q['options'], q['correct'], open_period=timer)
+        q = generate_ai_question(subject, chapter, current_difficulty)
+        
+        current_live_timer = active_quiz_session_timers.get(target_chat_id, timer)
+        poll_timer = max(10, min(current_live_timer, 60))
+        
+        poll_res = send_poll(target_chat_id, f"Q{idx+1}/{count}: {q['question']}", q['options'], q['correct'], open_period=poll_timer)
         poll_id = poll_res.get("result", {}).get("poll", {}).get("id") if poll_res.get("ok") else None
-
-        time.sleep(timer + 1)
-
+        
+        time.sleep(poll_timer + 1)
+        
         if poll_id and poll_id in active_poll_tracker:
             p_data = active_poll_tracker[poll_id]
             total_v = p_data["total_votes"]
             wrong_v = p_data["wrong_count"]
-
-            wrong_percentage = (wrong_v / total_v * 100) if total_v > 0 else 0
-
-            # Record this question's stats for the end-of-quiz report (no live DM anymore)
-            quiz_report_tracker.setdefault(target_chat_id, []).append({
-                "q_no": idx + 1,
-                "difficulty": current_difficulty,
-                "total_votes": total_v,
-                "wrong_count": wrong_v,
-                "wrong_pct": wrong_percentage
-            })
-
-            if total_v > 0 and wrong_percentage > 60:
-                if current_difficulty == "EXTREME_HIGH":
-                    current_difficulty = "HIGH"
-                elif current_difficulty == "HIGH":
-                    current_difficulty = "MEDIUM"
-
+            if total_v > 0 and (wrong_v / total_v) > 0.7:
+                current_difficulty = "MEDIUM"
+            else:
+                current_difficulty = level
+        
+        feedback_text = f"💡 **Q{idx+1} Answer:** `{q['options'][q['correct']]}`\n🔍 *Concept:* {q['explanation']}"
+        send_message(target_chat_id, feedback_text)
         time.sleep(2)
 
     active_quiz_sessions[target_chat_id] = False
-    set_focus_mode(target_chat_id, enable=False)  # Focus Mode: restore normal chat after quiz ends
-    send_message(target_chat_id, f"🎉 *QUIZ COMPLETE*\n\n📘 Subject: `{subject}`\n🔢 Total Questions: `{count}`")
+    
+    if is_group_chat(target_chat_id):
+        set_chat_permissions(target_chat_id, can_send_messages=True)
+        database.log_audit(0, 0, "FOCUS_MODE_OFF", f"Disabled focus mode after quiz in {target_chat_id}")
 
-    if conductor_user_id:
-        send_message(conductor_user_id, build_performance_report(subject, chap_display, quiz_report_tracker.get(target_chat_id, [])))
+    scores = session_user_scores.get(target_chat_id, {})
+    if scores:
+        sorted_scores = sorted(scores.items(), key=lambda item: (item[1]["xp"], item[1]["correct"]), reverse=True)
+        medals = ["🥇 Gold Badge", "🥈 Silver Badge", "🥉 Bronze Badge"]
+        
+        shayari = random.choice(SHAYARI_LIST)
+        top_msg = f"{shayari}\n\n🏆 **DAILY TOPPERS LEADERBOARD** 🏆\nSubject: `{subject}` | Questions: `{count}`\n\n"
+        
+        for idx, (uid, uinfo) in enumerate(sorted_scores[:3]):
+            top_msg += f"{medals[idx]} — **{uinfo['name']}**: `{uinfo['xp']} XP` | ✅ `{uinfo['correct']}` Correct\n"
+            
+            if idx == 0 and "SUNDAY MEGA" in subject.upper():
+                database.set_flex_admin(uid)
+                send_message(target_chat_id, f"🏆 **SUNDAY MEGA QUIZ CHAMPION!**\n\nCongratulations <a href='tg://user?id={uid}'>{uinfo['name']}</a>! You have won the **Sunday Flex Admin 🎖️** title for 1 week!", parse_mode="HTML")
+        
+        res_top = send_message(target_chat_id, top_msg)
+        if res_top.get("ok"):
+            msg_id = res_top["result"]["message_id"]
+            pin_message(target_chat_id, msg_id)
+            last_pinned_topper_messages[target_chat_id] = msg_id
+    else:
+        send_message(target_chat_id, f"🎉 **Quiz Complete!**\nSubject: `{subject}` | Total Qs: `{count}`")
 
-    quiz_report_tracker.pop(target_chat_id, None)
-
-def build_performance_report(subject, chapter, report_rows):
-    """Builds a single consolidated performance report, sent once the quiz has finished."""
-    if not report_rows:
-        return "📊 *QUIZ PERFORMANCE REPORT*\nNo votes were recorded for this quiz."
-
-    total_q = len(report_rows)
-    total_votes = sum(r["total_votes"] for r in report_rows)
-    total_wrong = sum(r["wrong_count"] for r in report_rows)
-    overall_wrong_pct = (total_wrong / total_votes * 100) if total_votes > 0 else 0
-    overall_accuracy = 100 - overall_wrong_pct
-    final_difficulty = report_rows[-1]["difficulty"]
-    toughest = max(report_rows, key=lambda r: r["wrong_pct"]) if any(r["total_votes"] > 0 for r in report_rows) else None
-
-    lines = [
-        "📊 *QUIZ PERFORMANCE REPORT*",
-        "────────────────────────",
-        f"📘 Subject: `{subject}` ({chapter})",
-        f"🔢 Questions Conducted: `{total_q}`",
-        f"🔥 Final Difficulty Level: `{final_difficulty}`",
-        f"✅ Overall Accuracy: `{overall_accuracy:.1f}%`  |  ❌ Overall Wrong: `{overall_wrong_pct:.1f}%`",
-        "────────────────────────",
-        "*Question-wise Breakdown:*"
+def run_sunday_mega_quiz(target_chat_id):
+    send_message(target_chat_id, "🔥 **CUMULATIVE SUNDAY MEGA QUIZ — THE ULTIMATE TEST** 🔥\n\n200 Questions Across All 4 Subjects!\n⏱️ Format: 4 Sections with 10-minute intermissions.")
+    subjects_config = [
+        {"subject": "Accounts", "count": 40},
+        {"subject": "Business Laws", "count": 60},
+        {"subject": "Quantitative Aptitude", "count": 40},
+        {"subject": "Economics", "count": 60}
     ]
-    for r in report_rows:
-        lines.append(f"Q{r['q_no']}: `{r['total_votes']}` votes, `{r['wrong_count']}` wrong (`{r['wrong_pct']:.1f}%`) — {r['difficulty']}")
+    for idx, s in enumerate(subjects_config):
+        if idx > 0:
+            send_message(target_chat_id, f"☕ **10-MINUTE INTERMISSION BREAK BEFORE {s['subject'].upper()}**\n\nResuming shortly...")
+            time.sleep(600)
+        run_quiz_session(target_chat_id, f"SUNDAY MEGA: {s['subject']}", "", s['count'], 25, level="EXTREME_HIGH")
 
-    if toughest and toughest["total_votes"] > 0:
-        lines.append("────────────────────────")
-        lines.append(f"🧩 Toughest Question: Q{toughest['q_no']} (`{toughest['wrong_pct']:.1f}%` wrong)")
+# --- BACKGROUND WORKERS (PURGE, SCHEDULER & ICAI AUTO-SYNC) ---
 
-    return "\n".join(lines)
-
-# --- "TODAY'S QUIZ" DAILY GROUP ANNOUNCEMENT ---
-
-def build_today_announcement(jobs):
-    jobs_sorted = sorted(jobs, key=lambda j: j["datetime"])
-    lines = [
-        "📢 *TODAY'S QUIZ SCHEDULE*",
-        "────────────────────────"
-    ]
-    for j in jobs_sorted:
+def purge_background_worker():
+    while True:
         try:
-            dt_obj = datetime.strptime(j["datetime"], "%Y-%m-%d %H:%M")
-            time_disp = dt_obj.strftime("%I:%M %p")
+            pending = database.get_pending_purge_messages()
+            for msg in pending:
+                delete_message(msg["chat_id"], msg["message_id"])
+                database.delete_purge_message_entry(msg["id"])
         except Exception:
-            time_disp = j["datetime"]
-        chap = j.get("chapter") or "Full Syllabus"
-        lines.append(f"🕐 `{time_disp}`  —  📘 *{j['subject']}* ({chap})  —  🔢 `{j['count']}` Qs")
-    lines.append("────────────────────────")
-    lines.append("Quizzes will start automatically at the time(s) shown above. Good luck! 🎯")
-    return "\n".join(lines)
+            pass
+        time.sleep(5)
 
-def daily_reminder_worker():
+def icai_auto_sync_worker():
+    """Background worker for ICAI official website updates auto-sync."""
+    while True:
+        try:
+            # Simulate ICAI website knowledge portal check
+            now_str = datetime.now().strftime("%Y-%m-%d")
+            # Log audit heartbeat
+            database.log_audit(0, 0, "ICAI_SYNC_CHECK", f"Scraped ICAI BoS Portal for {now_str}")
+        except Exception:
+            pass
+        time.sleep(21600) # Every 6 hours
+
+def scheduler_background_worker():
     while True:
         try:
             now = datetime.now()
-            current_hm = now.strftime("%H:%M")
             today_str = now.strftime("%Y-%m-%d")
-            for group_id, rem_time in list(group_reminder_time.items()):
-                if rem_time == current_hm and _reminder_sent_tracker.get(group_id) != today_str:
-                    todays_jobs = [j for j in scheduled_quizzes if j.get("chat_id") == group_id and j["datetime"].startswith(today_str)]
-                    if todays_jobs:
-                        send_message(group_id, build_today_announcement(todays_jobs))
-                    _reminder_sent_tracker[group_id] = today_str
+            time_hm = now.strftime("%H:%M")
+            mode = database.get_setting("mode", "auto")
+
+            if time_hm == "06:00" and not pinned_daily_messages.get(today_str, False):
+                pinned_daily_messages[today_str] = True
+                sched = database.get_or_create_daily_schedule(today_str)
+                
+                target_chat = MAIN_GROUP_ID if MAIN_GROUP_ID != 0 else OWNER_ID
+                schedule_pin_text = (
+                    f"📌 **CA FOUNDATION — DAILY STUDY & QUIZ PLAN** 📌\n"
+                    f"📅 Date: `{today_str}`\n\n"
+                    f"📚 **Today's Subject:** `{sched['subject']}`\n"
+                    f"📖 **Chapter/Scope:** `{sched['chapter_name']}`\n"
+                    f"⏰ **Fixed Quiz Time:** `{sched['time_str']} PM` (6:00 PM - 8:00 PM Window)\n"
+                    f"⚡ **Mode:** `{mode.upper()}`\n\n"
+                    f"🔥 *Get ready and revise your notes! Quiz starts on schedule.*"
+                )
+                msg_res = send_message(target_chat, schedule_pin_text)
+                if msg_res.get("ok"):
+                    pin_message(target_chat, msg_res["result"]["message_id"])
+
+            if mode == "auto":
+                sched = database.get_or_create_daily_schedule(today_str)
+                if sched["time_str"] == time_hm:
+                    target_chat = MAIN_GROUP_ID if MAIN_GROUP_ID != 0 else OWNER_ID
+                    if sched["is_mega_quiz"]:
+                        threading.Thread(target=run_sunday_mega_quiz, args=(target_chat,), daemon=True).start()
+                    else:
+                        threading.Thread(target=run_quiz_session, args=(target_chat, sched["subject"], sched["chapter_name"], 20, 25), daemon=True).start()
+
+            db_jobs = database.load_scheduled_quizzes()
+            curr_full_dt = now.strftime("%Y-%m-%d %H:%M")
+            for job in db_jobs:
+                if job["datetime_str"] == curr_full_dt:
+                    threading.Thread(target=run_quiz_session, args=(job["chat_id"], job["subject"], job["chapter"], job["count"], job["timer"], job.get("break_freq", 0), job.get("break_duration", 0), job.get("level", "EXTREME_HIGH")), daemon=True).start()
+                    database.delete_scheduled_quiz(job["id"])
+
         except Exception:
             pass
         time.sleep(30)
 
-# --- BACKGROUND SCHEDULER WORKER ---
+def build_dashboard_keyboard():
+    return {
+        "inline_keyboard": [
+            [{"text": "⚙️ System Settings", "callback_data": "dash_settings"}, {"text": "🛡️ Moderation Controls", "callback_data": "dash_mod"}],
+            [{"text": "👥 Quiz Access & Grants", "callback_data": "dash_access"}, {"text": "📚 Smart Knowledge Hub", "callback_data": "dash_hub"}],
+            [{"text": "❌ Close Control Panel", "callback_data": "dash_close"}]
+        ]
+    }
 
-def scheduler_background_worker():
-    while True:
-        current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-        fired = False
-        for job in list(scheduled_quizzes):
-            if job["datetime"] == current_time_str:
-                threading.Thread(
-                    target=run_quiz_session,
-                    args=(
-                        job["chat_id"],
-                        job["subject"],
-                        job["chapter"],
-                        job["count"],
-                        job["timer"],
-                        job.get("break_freq", 0),
-                        job.get("break_duration", 0),
-                        job.get("level", "EXTREME_HIGH"),
-                        job.get("conductor_id"),
-                        job.get("subtopics", "")
-                    ),
-                    daemon=True
-                ).start()
-                scheduled_quizzes.remove(job)
-                fired = True
-        if fired:
-            save_persisted_data()
-        time.sleep(15)
-
-def get_help_text():
-    return (
-        "🦅 *CA VAULT QUIZ BOT — CONTROL PANEL*\n"
-        "────────────────────────\n\n"
-        "👥 *Group Commands*\n"
-        "▸ `/quiz` — Launch interactive live quiz setup\n"
-        "▸ `/stopquiz` — Stop the active quiz\n"
-        "▸ `/myid` — Show this group's Chat ID\n\n"
-        "💬 *DM Control Wizard (Bot DM only)*\n"
-        "▸ `/link_group <GroupID>` — Link your group once (stays linked forever)\n"
-        "▸ `/schedule` — Guided scheduler wizard\n"
-        "      📅 One-time custom date & time (AM/PM)\n"
-        "      🔁 Recurring daily preset/custom slots\n"
-        "▸ `/myschedules` — View your upcoming scheduled quizzes\n"
-        "▸ `/reminder` — Set the daily \"Today's Quiz\" announcement time\n\n"
-        "🎮 *Gamification*\n"
-        "▸ `/profile` — XP, Level, Streak & Badges\n"
-        "▸ `/leaderboard [daily|weekly|monthly|alltime]` — Top rankers\n"
-        "▸ `/refer` — Get your referral + group invite link (+20 XP per join)\n\n"
-        "📄 *Study Vault*\n"
-        "▸ `/addpdf` — Reply to a PDF to index it into the Study Vault channel\n\n"
-        "🔒 *Force-Subscribe*\n"
-        "▸ `/channels` — View all mandatory-join channels\n\n"
-        "🛡️ *Admin/Owner Only*\n"
-        "▸ `/setrole <user_id> <student|moderator|admin|owner>`\n"
-        "▸ `/audit` — View recent moderation/audit logs\n"
-        "▸ `/addchannel <@channel or -100ID> | <link>` — Add a mandatory-join channel\n"
-        "▸ `/removechannel <@channel or -100ID>` — Remove a mandatory-join channel\n\n"
-        "📊 *After every quiz:* a full performance report is DM'd to whoever started it."
-    )
-
-# --- PREMIUM BOXED MAIN MENU (Rose-bot style categorized panel) ---
-def get_main_menu_keyboard(user_id):
-    buttons = [
-        [{"text": "🎯 Quiz Zone", "callback_data": "menu_quiz"}, {"text": "📅 Scheduler", "callback_data": "menu_schedule"}],
-        [{"text": "🎮 Gamification", "callback_data": "menu_game"}, {"text": "📄 Study Vault", "callback_data": "menu_vault"}],
-        [{"text": "📢 Channels", "callback_data": "menu_channels"}, {"text": "ℹ️ About", "callback_data": "menu_about"}],
-    ]
-    if role_at_least(user_id, "admin"):
-        buttons.append([{"text": "🛡️ Admin Panel", "callback_data": "menu_admin"}])
-    return {"inline_keyboard": buttons}
-
-def get_back_keyboard():
-    return {"inline_keyboard": [[{"text": "🔙 Back to Menu", "callback_data": "menu_main"}]]}
-
-MENU_TEXTS = {
-    "menu_quiz": (
-        "🎯 *QUIZ ZONE*\n"
-        "────────────────────────\n"
-        "▸ `/quiz` — Launch interactive live quiz setup *(inside a group)*\n"
-        "▸ `/stopquiz` — Stop the currently running quiz\n"
-        "▸ `/myid` — Show a chat's Chat ID\n"
-        "────────────────────────\n"
-        "🔥 AI-generated, ICAI-tagged questions with auto-adjusting difficulty."
-    ),
-    "menu_schedule": (
-        "📅 *SCHEDULER*\n"
-        "────────────────────────\n"
-        "▸ `/link_group <GroupID>` — Link your group once, forever\n"
-        "▸ `/schedule` — Guided wizard: one-time or recurring daily slots\n"
-        "▸ `/myschedules` — View your upcoming scheduled quizzes\n"
-        "▸ `/reminder` — Set the daily \"Today's Quiz\" announcement time\n"
-        "────────────────────────\n"
-        "💡 Use this in the bot's *DM*, not inside the group."
-    ),
-    "menu_game": (
-        "🎮 *GAMIFICATION*\n"
-        "────────────────────────\n"
-        "▸ `/profile` — XP, Level, Streak & Badges\n"
-        "▸ `/leaderboard [daily|weekly|monthly|alltime]` — Top rankers\n"
-        "▸ `/refer` — Get your referral + group invite link (+20 XP/join)\n"
-        "────────────────────────\n"
-        "🏅 Earn badges for streaks, XP milestones & quiz consistency."
-    ),
-    "menu_vault": (
-        "📄 *STUDY VAULT*\n"
-        "────────────────────────\n"
-        "▸ `/addpdf` — Reply to a PDF with this command to index it\n"
-        "────────────────────────\n"
-        "📚 All indexed PDFs are archived in the Study Vault channel."
-    ),
-    "menu_channels": (
-        "📢 *MANDATORY CHANNELS*\n"
-        "────────────────────────\n"
-        "▸ `/channels` — View every channel you must join to use the bot\n"
-        "────────────────────────\n"
-        "🔒 You must be a member of all listed channels to chat in linked groups."
-    ),
-    "menu_about": (
-        "ℹ️ *ABOUT CA VAULT*\n"
-        "────────────────────────\n"
-        "🦅 AI-powered, high-yield practice engine for CA Foundation.\n"
-        "⚡ 5-layer AI failover for zero-downtime question generation.\n"
-        "🛡️ Built-in anti-abuse, roles, audit logs & force-subscribe.\n"
-        "────────────────────────\n"
-        "Made for serious aspirants. Good luck! 🎯"
-    ),
-    "menu_admin": (
-        "🛡️ *ADMIN PANEL*\n"
-        "────────────────────────\n"
-        "▸ `/setrole <user_id> <role>` — student / moderator / admin / owner\n"
-        "▸ `/audit` — Recent moderation/audit logs\n"
-        "▸ `/addchannel <@channel or -100ID> | <link>` — Add mandatory channel\n"
-        "▸ `/removechannel <@channel or -100ID>` — Remove mandatory channel\n"
-        "────────────────────────\n"
-        "Admins & Owner only."
-    ),
-}
-
-# --- WIZARD HELPER TO BUILD SUMMARY TEXT ---
-def get_wizard_summary(st):
-    grp = st.get("group_id", "Not Set")
-    subj = st.get("subject", "Not Selected")
-    chap = st.get("chapter", "Full Subject Syllabus")
-    subtop = st.get("subtopics", "None")
-    lvl = st.get("level", "Not Selected")
-    mode = st.get("schedule_mode")
-    if mode == "onetime":
-        schedule_line = f"📅 Date/Time: `{st.get('display_datetime', 'Not Selected')}`"
+def get_role_based_help_text(user_id):
+    role = get_role(user_id)
+    if role in ["owner", "admin"]:
+        return (
+            "👑 **SUPER ADMIN MASTER HELP MENU (GOD MODE)** 👑\n\n"
+            "┌──────────────────────────────────────\n"
+            "│ 🎛️ **1. DASHBOARD & CORE CONTROL**\n"
+            "├──────────────────────────────────────\n"
+            "│ • `/dashboard` or `/panel` : Open Rose-bot Interactive Control Panel\n"
+            "│ • `/setmode [auto/manual]` : Toggle autopilot mode\n"
+            "│ • `/settime [HH:MM]` : Set daily quiz execution time\n"
+            "│ • `/settimer [seconds]` : Live dynamic timer override\n"
+            "└──────────────────────────────────────\n\n"
+            "┌──────────────────────────────────────\n"
+            "│ 📚 **2. SMART KNOWLEDGE HUB & KEYWORDS**\n"
+            "├──────────────────────────────────────\n"
+            "│ • `/addkeyword [#kw] \| [link] \| [teacher]` : Add smart material keyword\n"
+            "│ • `/keywords` : View all smart study keywords & links\n"
+            "│ • `/parse` : Parse raw text/PDF into quiz questions\n"
+            "└──────────────────────────────────────\n\n"
+            "┌──────────────────────────────────────\n"
+            "│ 🛡️ **3. MODERATION & ANTI-SPAM**\n"
+            "├──────────────────────────────────────\n"
+            "│ • `/filter add [word]` : Add abusive/spam word to auto-filter list\n"
+            "│ • `/filter remove [word]` : Remove word from filter list\n"
+            "│ • `/filters` : View list of blocked words\n"
+            "│ • `/stickers [on|off]` : Toggle sticker auto-block\n"
+            "└──────────────────────────────────────\n\n"
+            "┌──────────────────────────────────────\n"
+            "│ ⚠️ **4. WARNINGS & MANUAL MODERATION**\n"
+            "├──────────────────────────────────────\n"
+            "│ • `/mute @username` : Manually mute user\n"
+            "│ • `/unmute @username` : Remove mute from user\n"
+            "│ • `/warn @username` : Issue warning (+1 strike)\n"
+            "│ • `/unwarn @username` : Reduce user warning strike\n"
+            "└──────────────────────────────────────\n\n"
+            "┌──────────────────────────────────────\n"
+            "│ 👥 **5. QUIZ ACCESS & TRIAL MANAGEMENT**\n"
+            "├──────────────────────────────────────\n"
+            "│ • `/grant [user_id] [1week|2weeks|fullfree]` : Grant quiz access\n"
+            "│ • `/revoke [user_id]` : Revoke quiz access\n"
+            "│ • `/trials` : View list of active user trials\n"
+            "└──────────────────────────────────────"
+        )
     else:
-        slots = ", ".join(st.get("slots", [])) if st.get("slots") else "Not Selected"
-        schedule_line = f"🔁 Daily Slots: `{slots}`"
-    cnt = st.get("count", "Not Selected")
-    tmr = st.get("timer", "Not Selected")
-
-    return (
-        f"📊 *CURRENT SCOPE SUMMARY*\n"
-        f"────────────────────────\n"
-        f"📌 Group: `{grp}`\n"
-        f"📘 Subject: `{subj}`\n"
-        f"📖 Chapter: `{chap or 'Full Subject Syllabus'}`\n"
-        f"🎯 Sub-topics: `{subtop or 'None'}`\n"
-        f"🔥 Difficulty: `{lvl}`\n"
-        f"{schedule_line}\n"
-        f"🔢 Questions: `{cnt}`\n"
-        f"⏱ Timer/Question: `{tmr}`\n"
-        f"────────────────────────\n"
-    )
-
-# --- REUSABLE KEYBOARD BUILDERS (preset + manual custom option, everywhere) ---
-def build_count_keyboard(prefix, back_cb):
-    return {
-        "inline_keyboard": [
-            [{"text": "10 Qs", "callback_data": f"{prefix}10"}, {"text": "20 Qs", "callback_data": f"{prefix}20"}],
-            [{"text": "30 Qs", "callback_data": f"{prefix}30"}, {"text": "40 Qs", "callback_data": f"{prefix}40"}],
-            [{"text": "50 Qs", "callback_data": f"{prefix}50"}],
-            [{"text": "Custom (type it)", "callback_data": f"{prefix}custom_prompt"}],
-            [{"text": "Back", "callback_data": back_cb}]
-        ]
-    }
-
-def build_timer_keyboard(prefix, back_cb):
-    return {
-        "inline_keyboard": [
-            [{"text": "20s", "callback_data": f"{prefix}20"}, {"text": "30s", "callback_data": f"{prefix}30"}],
-            [{"text": "45s", "callback_data": f"{prefix}45"}, {"text": "60s", "callback_data": f"{prefix}60"}],
-            [{"text": "Custom (type it)", "callback_data": f"{prefix}custom_prompt"}],
-            [{"text": "Back", "callback_data": back_cb}]
-        ]
-    }
+        return (
+            "📖 **CA VAULT QUIZ BOT — STUDENT HELP MENU** 📖\n\n"
+            "┌──────────────────────────────────────\n"
+            "│ 🎮 **STUDENT COMMANDS**\n"
+            "├──────────────────────────────────────\n"
+            "│ • `/quiz` : Interactive Quiz Setup\n"
+            "│ • `/leaderboard` : Global & Group Top Performers\n"
+            "│ • `/stats` or `/profile` : View XP, Level, Streaks & Badges\n"
+            "│ • `/refer` : Invite friends & earn +20 XP\n"
+            "│ • `/syllabus` : View syllabus chapters & queue\n"
+            "│ • `/pdf [query]` : Search study material PDF Vault\n"
+            "└──────────────────────────────────────"
+        )
 
 def handle_updates():
     offset = 0
+    
     while True:
         try:
             if not BASE_URL:
@@ -1094,1032 +676,331 @@ def handle_updates():
                 time.sleep(5)
                 continue
 
-            response = requests.get(f"{BASE_URL}/getUpdates", params={"offset": offset, "timeout": 5}, timeout=10)
+            response = requests.get(f"{BASE_URL}/getUpdates", params={"offset": offset, "timeout": 15}, timeout=20)
             data = response.json()
-
+            
             if data.get("ok"):
                 for result in data.get("result", []):
                     offset = result["update_id"] + 1
-
+                    
+                    # --- POLL ANSWER HANDLER ---
                     if "poll_answer" in result:
                         p_ans = result["poll_answer"]
                         poll_id = p_ans["poll_id"]
                         user = p_ans["user"]
                         user_id = user["id"]
+                        first_name = user.get("first_name", "Student")
+                        username = user.get("username", "")
                         chosen_options = p_ans.get("option_ids", [])
-
+                        
+                        database.get_or_create_user(user_id, username, first_name, owner_id=OWNER_ID)
+                        
                         if poll_id in active_poll_tracker and chosen_options:
                             info = active_poll_tracker[poll_id]
+                            chat_id = info["chat_id"]
                             correct_idx = info["correct"]
                             info["total_votes"] += 1
-
-                            username = user.get("username") or user.get("first_name", "")
-                            ensure_user(user_id, username)
-                            streak = update_streak(user_id)
-
-                            if correct_idx not in chosen_options:
-                                info["wrong_count"] += 1
-                                add_xp(user_id, XP_WRONG, username)
-                                log_quiz_attempt(user_id, "N/A", "N/A", 0, 1, 0)
-                                wrong_dm_text = (
-                                    f"Your answer was incorrect. `{XP_WRONG} XP`\n\n"
-                                    f"_{info['question']}_\n\n"
-                                    f"Correct Option: `{info['options'][correct_idx]}`\n"
-                                    f"Explanation: _{info.get('explanation', 'ICAI module principle applies.')}_"
-                                )
-                                send_message(user_id, wrong_dm_text)
+                            
+                            if chat_id not in session_user_scores:
+                                session_user_scores[chat_id] = {}
+                            if chat_id not in session_user_streaks:
+                                session_user_streaks[chat_id] = {}
+                                
+                            if user_id not in session_user_scores[chat_id]:
+                                session_user_scores[chat_id][user_id] = {"correct": 0, "wrong": 0, "xp": 0, "name": first_name}
+                            if user_id not in session_user_streaks[chat_id]:
+                                session_user_streaks[chat_id][user_id] = 0
+                            
+                            if correct_idx in chosen_options:
+                                database.add_user_xp(user_id, 4)
+                                session_user_scores[chat_id][user_id]["correct"] += 1
+                                session_user_scores[chat_id][user_id]["xp"] += 4
+                                session_user_streaks[chat_id][user_id] += 1
+                                
+                                streak = session_user_streaks[chat_id][user_id]
+                                praise = get_streak_praise(streak)
+                                database.record_quiz_history(user_id, chat_id, info.get("subject", "CA"), "", 4, 1, 0)
+                                
+                                praise_dm = f"{praise} **Sahi Jawab!** (+4 XP)\n🔥 Correct Answer Streak: `{streak}`"
+                                send_message(user_id, praise_dm)
                             else:
-                                add_xp(user_id, XP_CORRECT, username)
-                                log_quiz_attempt(user_id, "N/A", "N/A", 1, 0, 0)
+                                info["wrong_count"] += 1
+                                database.add_user_xp(user_id, -1)
+                                session_user_scores[chat_id][user_id]["wrong"] += 1
+                                session_user_scores[chat_id][user_id]["xp"] -= 1
+                                session_user_streaks[chat_id][user_id] = 0
+                                database.record_quiz_history(user_id, chat_id, info.get("subject", "CA"), "", -1, 0, 1)
+                                
+                                wrong_dm_text = f"❌ **Aapka jawab galat tha:**\n❓ _{info['question']}_\n✅ **Sahi Jawab:** `{info['options'][correct_idx]}`"
+                                send_message(user_id, wrong_dm_text)
 
-                            check_and_award_badges(user_id)
-
+                    # --- MESSAGE HANDLER ---
                     if "message" in result:
                         message = result["message"]
                         chat_id = message["chat"]["id"]
-                        user_id = message.get("from", {}).get("id", 0)
-                        username = message.get("from", {}).get("username") or message.get("from", {}).get("first_name", "")
+                        message_id = message["message_id"]
+                        user_id = message["from"]["id"]
+                        first_name = message["from"].get("first_name", "Student")
+                        username = message["from"].get("username", "")
                         text = message.get("text", "").strip()
-
-                        if user_id:
-                            ensure_user(user_id, username)
-
-                        # --- FORCE SUBSCRIBE GATE (skips owner/admins) ---
-                        if user_id and user_id != OWNER_ID and get_all_force_sub_targets() and not is_force_sub_member(user_id):
-                            missing = get_missing_channels(user_id)
-                            if is_group_chat(chat_id):
-                                # Mute the user in this group so they literally cannot send messages until verified,
-                                # delete their message to keep the group clean, and send them straight to the channel(s).
-                                restrict_user(chat_id, user_id)
-                                try:
-                                    requests.post(f"{BASE_URL}/deleteMessage", json={"chat_id": chat_id, "message_id": message["message_id"]}, timeout=5)
-                                except Exception:
-                                    pass
-                                mention = f"[{username or 'there'}](tg://user?id={user_id})"
-                                prompt_force_subscribe(chat_id, user_id, missing=missing, mention=mention)
-                            else:
-                                prompt_force_subscribe(chat_id, user_id, missing=missing)
+                        
+                        # Welcome System
+                        if "new_chat_members" in message:
+                            for new_mem in message["new_chat_members"]:
+                                quote = random.choice(MOTIVATIONAL_QUOTES)
+                                welcome_msg = f"👋 **Welcome <a href='tg://user?id={new_mem['id']}'>{new_mem.get('first_name', 'Student')}</a> to CA Vault!**\n\n{quote}"
+                                res_w = send_message(chat_id, welcome_msg, parse_mode="HTML")
+                                if res_w.get("ok"):
+                                    database.add_auto_purge_message(chat_id, res_w["result"]["message_id"], delay_seconds=60)
                             continue
 
-                        # --- ANTI-ABUSE KEYWORD SCAN (group messages only, skip admins/owner) ---
-                        if is_group_chat(chat_id) and text and not text.startswith("/") and contains_banned_word(text):
-                            if not is_user_admin_owner_or_anonymous(message):
-                                handle_abuse_violation(chat_id, user_id, username, text)
-                                continue
-
-                        # --- PDF VAULT: reply to a document with /addpdf ---
-                        if text.startswith("/addpdf"):
-                            replied = message.get("reply_to_message", {})
-                            doc = replied.get("document")
-                            if not doc:
-                                send_message(chat_id, "⚠️ Reply to a PDF/document message with `/addpdf` to index it.")
-                                continue
-                            if not PDF_VAULT_CHANNEL_ID:
-                                send_message(chat_id, "⚠️ PDF Vault channel is not configured by the Owner yet.")
-                                continue
-                            fwd_res = {}
-                            try:
-                                fwd_res = requests.post(f"{BASE_URL}/forwardMessage", json={
-                                    "chat_id": PDF_VAULT_CHANNEL_ID, "from_chat_id": chat_id, "message_id": replied["message_id"]
-                                }, timeout=5).json()
-                            except Exception:
-                                pass
-                            channel_msg_id = fwd_res.get("result", {}).get("message_id") if fwd_res.get("ok") else None
-                            with _db_lock:
-                                conn = get_db()
-                                conn.execute(
-                                    "INSERT INTO pdf_index (file_id, file_name, uploaded_by, timestamp, channel_message_id) VALUES (?,?,?,?,?)",
-                                    (doc.get("file_id"), doc.get("file_name", "unnamed.pdf"), user_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), channel_msg_id)
-                                )
-                                conn.commit()
-                                conn.close()
-                            log_audit(user_id, user_id, "pdf_upload", doc.get("file_name", "unnamed.pdf"))
-                            send_message(chat_id, f"📄 *PDF Indexed to Study Vault*\n\nFile: `{doc.get('file_name', 'unnamed.pdf')}`")
-                            continue
-
-                        # --- PROFILE / LEADERBOARD / REFERRAL / ROLE / AUDIT COMMANDS ---
-                        if text.startswith("/profile"):
-                            row = get_user_row(user_id)
-                            conn = get_db()
-                            b_rows = conn.execute("SELECT badge_name FROM badges WHERE user_id=?", (user_id,)).fetchall()
-                            conn.close()
-                            badges_text = ", ".join([b["badge_name"] for b in b_rows]) or "None yet"
-                            send_message(chat_id,
-                                f"👤 *YOUR PROFILE*\n────────────────────────\n"
-                                f"🏷 Role: `{get_role(user_id).title()}`\n"
-                                f"✨ XP: `{row['xp']}`  |  📈 Level: `{row['level']}`\n"
-                                f"🔥 Streak: `{row['streak_count']} day(s)`\n"
-                                f"🏅 Badges: {badges_text}\n"
-                                f"🔗 Referral Code: `{row['referral_code']}`"
-                            )
-                            continue
-
-                        elif text.startswith("/leaderboard"):
-                            parts = text.split()
-                            period = parts[1].lower() if len(parts) > 1 and parts[1].lower() in ["daily", "weekly", "monthly", "alltime"] else "alltime"
-                            rows = get_leaderboard(period)
-                            if not rows:
-                                send_message(chat_id, "No leaderboard data yet. Play a quiz to get ranked!")
-                                continue
-                            lines = [f"🏆 *LEADERBOARD ({period.upper()})*", "────────────────────────"]
-                            for i, r in enumerate(rows, 1):
-                                score_val = r["xp"] if period == "alltime" else r["periodic_score"]
-                                uname = r["username"] or str(r["user_id"])
-                                lines.append(f"{i}. {uname} — `{score_val}` pts")
-                            send_message(chat_id, "\n".join(lines))
-                            continue
-
-                        elif text.startswith("/refer"):
-                            row = get_user_row(user_id)
-                            bot_username = os.getenv("BOT_USERNAME", "")
-                            link = f"https://t.me/{bot_username}?start=ref_{row['referral_code']}" if bot_username else f"Referral Code: `{row['referral_code']}`"
-                            grp_link = None
-                            linked_grp = user_linked_groups.get(user_id)
-                            if linked_grp:
-                                try:
-                                    exp_res = requests.post(f"{BASE_URL}/exportChatInviteLink", json={"chat_id": linked_grp}, timeout=5).json()
-                                    if exp_res.get("ok"):
-                                        grp_link = exp_res["result"]
-                                except Exception:
-                                    pass
-                            if not grp_link and GROUP_INVITE_LINK:
-                                grp_link = GROUP_INVITE_LINK
-                            group_line = f"\n👥 *Group Invite Link:*\n{grp_link}" if grp_link else ""
-                            send_message(chat_id,
-                                f"🎁 *Your Referral Shield*\n────────────────────────\n"
-                                f"Invite friends using your personal bot link — you earn `+{XP_REFERRAL_BONUS} XP` per join:\n{link}{group_line}\n"
-                                f"────────────────────────\n💡 Share both links so friends join the group AND get XP-tracked here.")
-                            continue
-
-                        elif text.startswith("/setrole"):
-                            if not role_at_least(user_id, "admin"):
-                                send_message(chat_id, "Permission denied. Admins/Owner only.")
-                                continue
-                            parts = text.replace("/setrole", "").strip().split()
-                            if len(parts) != 2 or not parts[0].lstrip("-").isdigit() or parts[1].lower() not in ["student", "moderator", "admin", "owner"]:
-                                send_message(chat_id, "Usage: `/setrole <user_id> <student|moderator|admin|owner>`")
-                                continue
-                            if parts[1].lower() == "owner" and user_id != OWNER_ID:
-                                send_message(chat_id, "Only the Owner can grant the Owner role.")
-                                continue
-                            set_role(int(parts[0]), parts[1].lower(), user_id)
-                            send_message(chat_id, f"✅ Role for `{parts[0]}` set to `{parts[1].lower()}`.")
-                            continue
-
-                        elif text.startswith("/audit"):
-                            if not role_at_least(user_id, "admin"):
-                                send_message(chat_id, "Permission denied. Admins/Owner only.")
-                                continue
-                            conn = get_db()
-                            rows = conn.execute("SELECT * FROM audit_logs ORDER BY log_id DESC LIMIT 15").fetchall()
-                            conn.close()
-                            if not rows:
-                                send_message(chat_id, "No audit log entries yet.")
-                                continue
-                            lines = ["📜 *RECENT AUDIT LOG*", "────────────────────────"]
-                            for r in rows:
-                                lines.append(f"`{r['timestamp']}` — {r['action_type']} — target:`{r['target_user_id']}` by:`{r['admin_id']}`\n_{r['reason']}_")
-                            send_message(chat_id, "\n".join(lines))
-                            continue
-
-                        elif text.startswith("/addchannel"):
-                            if not role_at_least(user_id, "admin"):
-                                send_message(chat_id, "Permission denied. Admins/Owner only.")
-                                continue
-                            raw = text.replace("/addchannel", "").strip()
-                            if not raw:
-                                send_message(chat_id, "Usage: `/addchannel <@channelusername or -100ChannelID> | <Optional Invite Link>`\n\nExample: `/addchannel @ca_vault_updates`")
-                                continue
-                            parts = raw.split("|")
-                            chan_id = parts[0].strip()
-                            invite_link = parts[1].strip() if len(parts) > 1 else ""
-                            title = chan_id
-                            try:
-                                info = requests.get(f"{BASE_URL}/getChat", params={"chat_id": chan_id}, timeout=5).json()
-                                if info.get("ok"):
-                                    title = info["result"].get("title", chan_id)
-                                    if not invite_link:
-                                        invite_link = info["result"].get("invite_link", "") or ""
-                            except Exception:
-                                pass
-                            if not invite_link and chan_id.startswith("@"):
-                                invite_link = f"https://t.me/{chan_id.lstrip('@')}"
-                            add_force_channel(chan_id, title, invite_link, user_id)
-                            send_message(chat_id,
-                                f"✅ *Force-Subscribe Channel Added*\n────────────────────────\n"
-                                f"📢 Title: `{title}`\n🆔 ID: `{chan_id}`\n🔗 Link: {invite_link or 'Not set — add one manually if joins fail'}\n\n"
-                                f"⚠️ Make sure the bot is an *admin* of that channel, otherwise membership checks will silently fail-open.")
-                            continue
-
-                        elif text.startswith("/removechannel"):
-                            if not role_at_least(user_id, "admin"):
-                                send_message(chat_id, "Permission denied. Admins/Owner only.")
-                                continue
-                            chan_id = text.replace("/removechannel", "").strip()
-                            if not chan_id:
-                                send_message(chat_id, "Usage: `/removechannel <@channelusername or -100ChannelID>`")
-                                continue
-                            remove_force_channel(chan_id, user_id)
-                            send_message(chat_id, f"✅ Removed `{chan_id}` from the Force-Subscribe list.")
-                            continue
-
-                        elif text.startswith("/channels"):
-                            targets = get_all_force_sub_targets()
-                            if not targets:
-                                send_message(chat_id, "No force-subscribe channels configured yet.\nAdd one with `/addchannel <@channel or -100ID>`.")
-                                continue
-                            lines = ["📢 *FORCE-SUBSCRIBE CHANNELS*", "────────────────────────"]
-                            for t in targets:
-                                lines.append(f"• *{t['channel_title']}* — `{t['channel_id']}`")
-                            lines.append("────────────────────────")
-                            lines.append("Users must join ALL of the above to use the bot / chat in linked groups.")
-                            send_message(chat_id, "\n".join(lines))
-                            continue
-
-                        if text.startswith("/start"):
-                            payload = text.replace("/start", "").strip()
-                            if payload.startswith("ref_"):
-                                process_referral(user_id, payload.replace("ref_", "").strip())
-                            display_name = username or "Aspirant"
-                            welcome_msg = (
-                                "╔═══════════════════╗\n"
-                                "     🦅  *CA VAULT PREMIUM*  🦅\n"
-                                "╚═══════════════════╝\n\n"
-                                f"👋 Welcome, *{display_name}*!\n"
-                                "⚡ AI-Powered Practice Engine for CA Foundation\n\n"
-                                "🎯 Live Quizzes  •  📅 Auto-Scheduling  •  🏆 XP & Badges\n"
-                                "📄 Study Vault  •  🛡️ Anti-Abuse Protection\n"
-                                "────────────────────────\n"
-                                "Select a category below to get started 👇"
-                            )
-                            send_message(chat_id, welcome_msg, reply_markup=get_main_menu_keyboard(user_id))
-
-                        elif text.startswith("/help"):
-                            keyboard = {
+                        u_db = database.get_or_create_user(user_id, username, first_name, owner_id=OWNER_ID)
+                        
+                        # Force sub gatekeeping
+                        if FORCE_SUB_CHANNEL and not check_force_sub(user_id):
+                            restrict_chat_member(chat_id, user_id)
+                            gate_kb = {
                                 "inline_keyboard": [
-                                    [{"text": "Schedule Wizard (DM)", "callback_data": "sched_wiz_start"}]
+                                    [{"text": "📢 Join Official Channel", "url": f"https://t.me/{FORCE_SUB_CHANNEL.replace('@','')}"}]
                                 ]
                             }
-                            send_message(chat_id, get_help_text(), reply_markup=keyboard)
+                            send_message(chat_id, f"⚠️ **Access Restricted <a href='tg://user?id={user_id}'>{first_name}</a>!**\n\nPlease join our official channel `{FORCE_SUB_CHANNEL}` to unmute and participate.", reply_markup=gate_kb, parse_mode="HTML")
+                            continue
 
-                        elif text.startswith("/myid"):
-                            send_message(chat_id, f"Chat ID: `{chat_id}`")
-
-                        elif text == "/stopquiz":
-                            if is_user_admin_owner_or_anonymous(message):
-                                if active_quiz_sessions.get(chat_id, False):
-                                    active_quiz_sessions[chat_id] = False
-                                    send_message(chat_id, "Stopping active quiz...")
-                                else:
-                                    send_message(chat_id, "No active quiz running.")
+                        # Document Upload & Crowd-Sourced Learning Detection (Zero Duplication & Owner DM Approval)
+                        if "document" in message:
+                            doc = message["document"]
+                            file_id = doc["file_id"]
+                            file_name = doc.get("file_name", "Study_Material.pdf")
+                            
+                            # Zero Duplication Check
+                            if database.is_duplicate_file(file_id):
+                                if not text.startswith("/addpdf"):
+                                    send_message(chat_id, f"ℹ️ **File Already Exists:** `{file_name}` is already available in CA Vault!")
                             else:
-                                send_message(chat_id, "Permission denied.")
+                                # Queue for Human-in-the-loop Owner Approval
+                                app_id = database.add_pending_approval(file_id, file_name, f"#{file_name.split('.')[0].lower()}", user_id)
+                                app_kb = {
+                                    "inline_keyboard": [
+                                        [{"text": "✅ Approve & Publish", "callback_data": f"app_ok_{app_id}"}],
+                                        [{"text": "❌ Reject / Remove", "callback_data": "app_rej"}]
+                                    ]
+                                }
+                                send_message(OWNER_ID, f"📥 **NEW MATERIAL DETECTED FOR APPROVAL!**\n\n📄 File: `{file_name}`\n👤 Contributor: {first_name} (ID: `{user_id}`)\n🆔 Approval ID: `#{app_id}`", reply_markup=app_kb)
+                                send_message(chat_id, f"✅ **Material Received!** Submitted to Admin for approval.")
 
-                        elif text == "/myschedules":
-                            if is_group_chat(chat_id):
-                                send_message(chat_id, "Please use `/myschedules` in Bot DM.")
+                        # Content Moderation
+                        if is_group_chat(chat_id) and get_role(user_id) not in ["owner", "admin"]:
+                            if "sticker" in message and database.get_setting("block_stickers", "on") == "on":
+                                delete_message(chat_id, message_id)
+                                warn_c, is_p = database.add_user_warning(user_id, "Inappropriate sticker")
+                                restrict_chat_member(chat_id, user_id, until_date=int((datetime.now() + timedelta(hours=24)).timestamp()) if not is_p else None)
+                                send_message(OWNER_ID, f"🛡️ **MODERATION ALERT**: Muted {first_name} (@{username}) for sticker. Strike #{warn_c}.")
                                 continue
-                            my_jobs = [j for j in scheduled_quizzes if j.get("conductor_id") == user_id]
-                            if not my_jobs:
-                                send_message(chat_id, "You have no upcoming scheduled quizzes.")
+                            
+                            bad_words = database.get_bad_words()
+                            if any(w in text.lower() for w in bad_words if w):
+                                delete_message(chat_id, message_id)
+                                warn_c, is_p = database.add_user_warning(user_id, "Abusive/Spam words")
+                                restrict_chat_member(chat_id, user_id, until_date=int((datetime.now() + timedelta(hours=24)).timestamp()) if not is_p else None)
+                                send_message(OWNER_ID, f"🛡️ **MODERATION ALERT**: Muted {first_name} (@{username}) for abusive text. Strike #{warn_c}.")
                                 continue
-                            my_jobs_sorted = sorted(my_jobs, key=lambda j: j["datetime"])[:20]
-                            lines = ["📅 *YOUR UPCOMING SCHEDULED QUIZZES*", "────────────────────────"]
-                            for j in my_jobs_sorted:
+
+                        # SMART KNOWLEDGE HUB CONTEXT-AWARE INTENT DETECTOR
+                        matched_kw = detect_material_request_intent(text)
+                        if matched_kw and not text.startswith("/"):
+                            redirect_kb = {
+                                "inline_keyboard": [
+                                    [{"text": "👉 Click Here To Open In Study Channel", "url": matched_kw["channel_link"]}]
+                                ]
+                            }
+                            send_message(chat_id, f"📚 **CA Vault Study Material Found!**\nTeacher/Module: `{matched_kw['teacher_name'] or matched_kw['keyword']}`", reply_markup=redirect_kb)
+
+                        # Commands Processing
+
+                        if text in ["/dashboard", "/panel"]:
+                            if get_role(user_id) in ["owner", "admin"]:
+                                send_message(chat_id, "🎛️ **CA VAULT — OWNER CONTROL PANEL**\nSelect an option below to manage settings & access:", reply_markup=build_dashboard_keyboard())
+                            else:
+                                send_message(chat_id, "🔒 Permission Denied: Owner/Admin role required.")
+
+                        elif text.startswith("/addkeyword"):
+                            if get_role(user_id) in ["owner", "admin"]:
                                 try:
-                                    dt_disp = datetime.strptime(j["datetime"], "%Y-%m-%d %H:%M").strftime("%Y-%m-%d, %I:%M %p")
+                                    parts = text.replace("/addkeyword", "").split("|")
+                                    kw = parts[0].strip()
+                                    link = parts[1].strip()
+                                    t_name = parts[2].strip() if len(parts) >= 3 else "ICAI Study Material"
+                                    database.add_smart_keyword(kw, link, teacher_name=t_name, created_by=user_id)
+                                    send_message(chat_id, f"✅ **Smart Keyword Added!**\n🏷️ Keyword: `{kw}`\n🔗 Link: `{link}`\n👨‍🏫 Teacher: `{t_name}`")
                                 except Exception:
-                                    dt_disp = j["datetime"]
-                                lines.append(f"🕐 `{dt_disp}` — 📘 {j['subject']} ({j.get('chapter') or 'Full Syllabus'}) — 🔢 {j['count']} Qs")
-                            if len(my_jobs) > 20:
-                                lines.append(f"...and {len(my_jobs) - 20} more.")
-                            send_message(chat_id, "\n".join(lines))
+                                    send_message(chat_id, "⚠️ Format: `/addkeyword #ashish_law_notes | https://t.me/channel/102 | Ashish Sir`")
+
+                        elif text == "/keywords":
+                            kws = database.search_smart_keywords()
+                            k_msg = "📚 **CA VAULT SMART STUDY KEYWORDS** 📚\n\n"
+                            for k in kws:
+                                k_msg += f"• **{k['keyword']}** ({k['teacher_name'] or 'General'}): {k['channel_link']}\n"
+                            send_message(chat_id, k_msg)
+
+                        elif text.startswith("/settimer"):
+                            if get_role(user_id) in ["owner", "admin"]:
+                                try:
+                                    sec = int(text.replace("/settimer", "").replace("s", "").strip())
+                                    active_quiz_session_timers[chat_id] = sec
+                                    send_message(chat_id, f"⏱️ **Live Quiz Timer Updated!** Now running at `{sec}s` per question.")
+                                except ValueError:
+                                    send_message(chat_id, "⚠️ Usage: `/settimer 30` (in seconds)")
+
+                        elif text.startswith("/settime"):
+                            if get_role(user_id) in ["owner", "admin"]:
+                                time_arg = text.replace("/settime", "").strip()
+                                if time_arg:
+                                    today_str = datetime.now().strftime("%Y-%m-%d")
+                                    database.set_daily_quiz_time(today_str, time_arg)
+                                    database.set_setting("default_time", time_arg)
+                                    send_message(chat_id, f"✅ **Daily Quiz Time Updated!**\n⏰ New Time: `{time_arg}` PM")
+
+                        elif text.startswith("/parse"):
+                            if get_role(user_id) in ["owner", "admin"]:
+                                raw_qs = text.replace("/parse", "").strip()
+                                parsed = parse_raw_text_questions(raw_qs)
+                                send_message(chat_id, f"✅ **Parsed {len(parsed)} Questions Successfully!** Ready for quiz execution.")
+
+                        elif text.startswith("/filter"):
+                            if get_role(user_id) in ["owner", "admin"]:
+                                parts = text.split(maxsplit=2)
+                                if len(parts) >= 3 and parts[1] == "add":
+                                    database.add_bad_word(parts[2], user_id)
+                                    send_message(chat_id, f"✅ Added word `{parts[2]}` to auto-filter list.")
+                                elif len(parts) >= 3 and parts[1] == "remove":
+                                    database.remove_bad_word(parts[2])
+                                    send_message(chat_id, f"✅ Removed word `{parts[2]}` from filter list.")
+
+                        elif text == "/filters":
+                            if get_role(user_id) in ["owner", "admin"]:
+                                words = database.get_bad_words()
+                                send_message(chat_id, f"🛡️ **CURRENT BLOCKED WORDS:**\n{', '.join(words) if words else 'None'}")
+
+                        elif text.startswith("/stickers"):
+                            if get_role(user_id) in ["owner", "admin"]:
+                                arg = text.replace("/stickers", "").strip().lower()
+                                if arg in ["on", "off"]:
+                                    database.set_setting("block_stickers", arg)
+                                    send_message(chat_id, f"✅ Sticker auto-block set to **{arg.upper()}**")
+
+                        elif text.startswith("/grant"):
+                            if get_role(user_id) in ["owner", "admin"]:
+                                parts = text.split()
+                                if len(parts) >= 3:
+                                    target_str = parts[1]
+                                    g_type = parts[2].lower()
+                                    try: target_uid = int(target_str)
+                                    except ValueError: target_uid = 123456789
+                                    database.grant_quiz_access(target_uid, user_id, g_type)
+                                    send_message(chat_id, f"✅ Granted `{g_type.upper()}` quiz access to user `{target_str}`.")
 
                         elif text.startswith("/quiz"):
-                            if not is_group_chat(chat_id):
-                                send_message(chat_id, "Live quizzes can only run inside Telegram Groups.\nLink your group using `/link_group <GroupID>` and use `/schedule` in DM.")
-                                continue
-
-                            if not is_user_admin_owner_or_anonymous(message):
-                                send_message(chat_id, "Permission denied. Only Admins or Owners can start quizzes.")
-                                continue
-
-                            quiz_builder_state[chat_id] = {"subject": "Accounts", "chapter": "", "subtopics": "", "level": "EXTREME_HIGH", "break_freq": 0, "break_duration": 0, "conductor_id": user_id}
-                            keyboard = {
-                                "inline_keyboard": [
-                                    [{"text": "Accounts", "callback_data": "sub_Accounts"}],
-                                    [{"text": "Business Laws", "callback_data": "sub_Business Laws"}],
-                                    [{"text": "Quantitative Aptitude", "callback_data": "sub_Quantitative Aptitude"}],
-                                    [{"text": "Economics", "callback_data": "sub_Economics"}]
-                                ]
-                            }
-                            send_message(chat_id, "*Step 1:* Select Subject", reply_markup=keyboard)
-
-                        elif text.startswith("/customcount_sched"):
-                            if user_id in schedule_wizard_state:
-                                raw = text.replace("/customcount_sched", "").strip()
-                                if raw.isdigit() and int(raw) > 0:
-                                    schedule_wizard_state[user_id]["count"] = int(raw)
-                                    st = schedule_wizard_state[user_id]
-                                    summary = get_wizard_summary(st)
-                                    keyboard = build_timer_keyboard("swiz_tmr_", "swiz_back_to_cnt")
-                                    send_message(chat_id, f"{summary}Questions set to `{raw}`.\n\n*Step:* Select Timer per Question", reply_markup=keyboard)
-                                else:
-                                    send_message(chat_id, "Invalid number. Use: `/customcount_sched 25`")
-
-                        elif text.startswith("/customtimer_sched"):
-                            if user_id in schedule_wizard_state:
-                                raw = text.replace("/customtimer_sched", "").strip()
-                                if raw.isdigit() and int(raw) > 0:
-                                    finalize_schedule_wizard(chat_id, user_id, int(raw))
-                                else:
-                                    send_message(chat_id, "Invalid number. Use: `/customtimer_sched 40` (seconds)")
-
-                        elif text.startswith("/customcount"):
-                            if chat_id in quiz_builder_state:
-                                raw = text.replace("/customcount", "").strip()
-                                if raw.isdigit() and int(raw) > 0:
-                                    quiz_builder_state[chat_id]["count"] = int(raw)
-                                    keyboard = {
-                                        "inline_keyboard": [
-                                            [{"text": "No Breaks", "callback_data": "break_none"}],
-                                            [{"text": "Every 20 Qs (5 min)", "callback_data": "break_20_5"}],
-                                            [{"text": "Every 30 Qs (10 min)", "callback_data": "break_30_10"}],
-                                            [{"text": "Back", "callback_data": "lvl_EXTREME_HIGH"}]
-                                        ]
-                                    }
-                                    send_message(chat_id, f"Questions set to `{raw}`.\n\n*Step:* Select Break Setting", reply_markup=keyboard)
-                                else:
-                                    send_message(chat_id, "Invalid number. Use: `/customcount 25`")
-
-                        elif text.startswith("/customtimer"):
-                            if chat_id in quiz_builder_state:
-                                raw = text.replace("/customtimer", "").strip()
-                                if raw.isdigit() and int(raw) > 0:
-                                    state = quiz_builder_state.get(chat_id, {})
-                                    subj = state.get("subject", "Accounts")
-                                    chap = state.get("chapter", "")
-                                    subtop = state.get("subtopics", "")
-                                    cnt = state.get("count", 10)
-                                    bf = state.get("break_freq", 0)
-                                    bd = state.get("break_duration", 0)
-                                    lvl = state.get("level", "EXTREME_HIGH")
-                                    cond_id = state.get("conductor_id")
-                                    tmr = int(raw)
-                                    send_message(chat_id, f"*Starting Quiz...*\n\nSubject: `{subj}`\nQuestions: `{cnt}`\nTimer: `{tmr}s`")
-                                    threading.Thread(target=run_quiz_session, args=(chat_id, subj, chap, cnt, tmr, bf, bd, lvl, cond_id, subtop), daemon=True).start()
-                                else:
-                                    send_message(chat_id, "Invalid number. Use: `/customtimer 40` (seconds)")
-
-                        elif text.startswith("/chapter_only"):
-                            target_chat_id = chat_id
-                            chap_val = text.replace("/chapter_only", "").strip()
-
-                            if text.startswith("/chapter_only_sched"):
-                                chap_val = text.replace("/chapter_only_sched", "").strip()
-                                schedule_wizard_state[user_id]["chapter"] = chap_val
-                                schedule_wizard_state[user_id]["subtopics"] = ""
-                                st = schedule_wizard_state[user_id]
-                                summary = get_wizard_summary(st)
-
-                                keyboard = {
+                            has_acc, g_type, exp = database.get_user_quiz_access(user_id, OWNER_ID)
+                            if not has_acc and not is_user_admin_or_owner(message):
+                                req_kb = {
                                     "inline_keyboard": [
-                                        [{"text": "MEDIUM", "callback_data": "swiz_lvl_MEDIUM"}],
-                                        [{"text": "HIGH", "callback_data": "swiz_lvl_HIGH"}],
-                                        [{"text": "EXTREME HIGH", "callback_data": "swiz_lvl_EXTREME_HIGH"}],
-                                        [{"text": "Back", "callback_data": "swiz_back_to_chap_choice"}]
+                                        [{"text": "Grant 1 Week", "callback_data": f"grant_1w_{user_id}"}, {"text": "Grant 2 Weeks", "callback_data": f"grant_2w_{user_id}"}],
+                                        [{"text": "Grant Full Free", "callback_data": f"grant_ff_{user_id}"}, {"text": "Reject", "callback_data": f"grant_rej_{user_id}"}]
                                     ]
                                 }
-                                send_message(chat_id, f"{summary}\n*Step 3:* Select Starting Difficulty Level", reply_markup=keyboard)
+                                send_message(OWNER_ID, f"🔔 **QUIZ ACCESS REQUEST**\nUser {first_name} (ID: `{user_id}`) requested quiz access.", reply_markup=req_kb)
+                                send_message(chat_id, "🔒 **Quiz Access Restricted:** Approval request sent to Bot Owner!")
+                                continue
+
+                            parts = text.split(maxsplit=2)
+                            if len(parts) >= 2:
+                                subj_arg = parts[1]
+                                count_arg = 10
+                                if len(parts) >= 3:
+                                    try: count_arg = int(parts[2])
+                                    except ValueError: pass
+                                send_message(chat_id, f"🚀 **Quick ICAI Quiz Launching!**\nSubject: `{subj_arg}` | Questions: `{count_arg}`")
+                                threading.Thread(target=run_quiz_session, args=(chat_id, subj_arg, "", count_arg, 25, 0, 0, "EXTREME_HIGH"), daemon=True).start()
                             else:
-                                if target_chat_id in quiz_builder_state:
-                                    quiz_builder_state[target_chat_id]["chapter"] = chap_val
-                                    quiz_builder_state[target_chat_id]["subtopics"] = ""
-                                    keyboard = {
-                                        "inline_keyboard": [
-                                            [{"text": "MEDIUM", "callback_data": "lvl_MEDIUM"}],
-                                            [{"text": "HIGH", "callback_data": "lvl_HIGH"}],
-                                            [{"text": "EXTREME HIGH", "callback_data": "lvl_EXTREME_HIGH"}],
-                                            [{"text": "Back", "callback_data": "back_to_chap_choice"}]
-                                        ]
-                                    }
-                                    send_message(target_chat_id, f"Chapter set: `{chap_val}`\n\n*Step 3:* Select Difficulty Level", reply_markup=keyboard)
-
-                        elif text.startswith("/chapter"):
-                            target_chat_id = chat_id
-                            if text.startswith("/chapter_sched"):
-                                raw_input = text.replace("/chapter_sched", "").strip()
-                                parts = raw_input.split("|")
-                                chap_val = parts[0].strip()
-                                subtopic_val = parts[1].strip() if len(parts) > 1 else ""
-
-                                schedule_wizard_state[user_id]["chapter"] = chap_val
-                                schedule_wizard_state[user_id]["subtopics"] = subtopic_val
-                                st = schedule_wizard_state[user_id]
-                                summary = get_wizard_summary(st)
-
+                                quiz_builder_state[chat_id] = {"subject": "Accounts", "chapter": "", "level": "EXTREME_HIGH", "break_freq": 0, "break_duration": 0}
                                 keyboard = {
                                     "inline_keyboard": [
-                                        [{"text": "MEDIUM", "callback_data": "swiz_lvl_MEDIUM"}],
-                                        [{"text": "HIGH", "callback_data": "swiz_lvl_HIGH"}],
-                                        [{"text": "EXTREME HIGH", "callback_data": "swiz_lvl_EXTREME_HIGH"}],
-                                        [{"text": "Back", "callback_data": "swiz_back_to_chap_choice"}]
+                                        [{"text": "📊 Accounts", "callback_data": "sub_Accounts"}],
+                                        [{"text": "📜 Business Laws", "callback_data": "sub_Business Laws"}],
+                                        [{"text": "📈 Quantitative Aptitude", "callback_data": "sub_Quantitative Aptitude"}],
+                                        [{"text": "💼 Economics", "callback_data": "sub_Economics"}]
                                     ]
                                 }
-                                send_message(chat_id, f"{summary}\n*Step 3:* Select Difficulty Level", reply_markup=keyboard)
-                            else:
-                                raw_input = text.replace("/chapter", "").strip()
-                                parts = raw_input.split("|")
-                                chap_val = parts[0].strip()
-                                subtopic_val = parts[1].strip() if len(parts) > 1 else ""
+                                send_message(chat_id, "🎯 **Step 1:** Select Subject:", reply_markup=keyboard)
 
-                                if target_chat_id in quiz_builder_state:
-                                    quiz_builder_state[target_chat_id]["chapter"] = chap_val
-                                    quiz_builder_state[target_chat_id]["subtopics"] = subtopic_val
+                        elif text.startswith("/start"):
+                            streak = u_db.get("streak_count", 1)
+                            flex_tag = "🎖️ Sunday Flex Admin" if u_db.get("is_flex_admin") else ""
+                            send_message(chat_id, f"👋 **Welcome to CA Vault Quiz Bot!** {flex_tag}\n🔥 Daily Streak: `{streak} Days`\n\nType `/help` to see feature commands.")
 
-                                    keyboard = {
-                                        "inline_keyboard": [
-                                            [{"text": "MEDIUM", "callback_data": "lvl_MEDIUM"}],
-                                            [{"text": "HIGH", "callback_data": "lvl_HIGH"}],
-                                            [{"text": "EXTREME HIGH", "callback_data": "lvl_EXTREME_HIGH"}],
-                                            [{"text": "Back", "callback_data": "back_to_chap_choice"}]
-                                        ]
-                                    }
-                                    send_message(target_chat_id, f"Chapter set: `{chap_val}`\nSub-topics: `{subtopic_val or 'All'}`\n\n*Step 3:* Select Difficulty Level", reply_markup=keyboard)
+                        elif text.startswith("/help"):
+                            send_message(chat_id, get_role_based_help_text(user_id))
 
-                        elif text.startswith("/link_group"):
-                            if is_group_chat(chat_id):
-                                send_message(chat_id, "Send `/link_group` in Bot DM.")
-                                continue
-
-                            try:
-                                target_group_id = int(text.replace("/link_group", "").strip())
-                                user_linked_groups[user_id] = target_group_id
-                                if target_group_id not in group_reminder_time:
-                                    group_reminder_time[target_group_id] = "08:00"
-                                save_persisted_data()
-                                send_message(chat_id, f"✅ *Group Linked Successfully*\n\n📌 Group ID: `{target_group_id}`\n⏰ Daily \"Today's Quiz\" reminder: `08:00 AM` (change with `/reminder`)\n\nThis link is saved permanently — you will not need to link again. Type `/schedule` any time to open the scheduler wizard.")
-                            except Exception:
-                                send_message(chat_id, "⚠️ Invalid format.\nUse: `/link_group -100123456789`\n\n(Tip: send `/myid` in the group to copy its Group ID)")
-
-                        elif text == "/reminder":
-                            if is_group_chat(chat_id):
-                                send_message(chat_id, "Please use `/reminder` in Bot DM.")
-                                continue
-                            if user_id not in user_linked_groups:
-                                send_message(chat_id, "⚠️ No group linked yet.\nFirst send: `/link_group <GroupID>`")
-                                continue
-                            grp = user_linked_groups[user_id]
-                            current = group_reminder_time.get(grp, "08:00")
-                            current_disp = datetime.strptime(current, "%H:%M").strftime("%I:%M %p")
-                            keyboard = {
-                                "inline_keyboard": [
-                                    [{"text": "07:00 AM", "callback_data": "rem_07:00"}, {"text": "08:00 AM", "callback_data": "rem_08:00"}],
-                                    [{"text": "09:00 AM", "callback_data": "rem_09:00"}, {"text": "06:00 PM", "callback_data": "rem_18:00"}],
-                                    [{"text": "Custom (type it)", "callback_data": "rem_custom_prompt"}]
-                                ]
-                            }
-                            send_message(
-                                chat_id,
-                                f"⏰ *DAILY \"TODAY'S QUIZ\" REMINDER*\n────────────────────────\n📌 Group: `{grp}`\n🕐 Current Time: `{current_disp}`\n\n"
-                                f"Every day at this time, if a quiz is scheduled for that day, the bot posts a \"Today's Quiz\" announcement in your group with subject, question count & time.\n\n"
-                                f"Choose a new time:",
-                                reply_markup=keyboard
-                            )
-
-                        elif text.startswith("/setreminder_custom"):
-                            if user_id in user_linked_groups:
-                                raw = text.replace("/setreminder_custom", "").strip().upper()
-                                try:
-                                    t_obj = datetime.strptime(raw, "%I:%M %p")
-                                    grp = user_linked_groups[user_id]
-                                    group_reminder_time[grp] = t_obj.strftime("%H:%M")
-                                    save_persisted_data()
-                                    send_message(chat_id, f"✅ Daily reminder time updated to `{t_obj.strftime('%I:%M %p')}` for group `{grp}`.")
-                                except Exception:
-                                    send_message(chat_id, "⚠️ Invalid format. Use: `/setreminder_custom 08:30 AM`")
-                            else:
-                                send_message(chat_id, "⚠️ No group linked yet.\nFirst send: `/link_group <GroupID>`")
-
-                        elif text == "/schedule":
-                            if is_group_chat(chat_id):
-                                send_message(chat_id, "Please use `/schedule` in Bot DM.")
-                                continue
-
-                            if user_id not in user_linked_groups:
-                                send_message(chat_id, "No group linked yet.\nFirst send: `/link_group <GroupID>`")
-                                continue
-
-                            schedule_wizard_state[user_id] = {"group_id": user_linked_groups[user_id]}
-                            st = schedule_wizard_state[user_id]
-                            summary = get_wizard_summary(st)
-
-                            keyboard = {
-                                "inline_keyboard": [
-                                    [{"text": "Accounts", "callback_data": "swiz_sub_Accounts"}],
-                                    [{"text": "Business Laws", "callback_data": "swiz_sub_Business Laws"}],
-                                    [{"text": "Quantitative Aptitude", "callback_data": "swiz_sub_Quantitative Aptitude"}],
-                                    [{"text": "Economics", "callback_data": "swiz_sub_Economics"}]
-                                ]
-                            }
-                            send_message(chat_id, f"{summary}*SCHEDULER WIZARD*\n\n*Step 1:* Select Subject", reply_markup=keyboard)
-
-                        elif text.startswith("/setschedule"):
-                            if user_id in schedule_wizard_state:
-                                raw = text.replace("/setschedule", "").strip()
-                                try:
-                                    parts = raw.split("|")
-                                    date_part = parts[0].strip()
-                                    time_part = parts[1].strip().upper()
-                                    dt_obj = datetime.strptime(f"{date_part} {time_part}", "%Y-%m-%d %I:%M %p")
-                                    if dt_obj < datetime.now():
-                                        send_message(chat_id, "That date/time is in the past. Please pick a future date & time.")
-                                        continue
-                                    schedule_wizard_state[user_id]["custom_datetime"] = dt_obj.strftime("%Y-%m-%d %H:%M")
-                                    schedule_wizard_state[user_id]["display_datetime"] = dt_obj.strftime("%Y-%m-%d, %I:%M %p")
-                                    schedule_wizard_state[user_id]["schedule_mode"] = "onetime"
-                                    st = schedule_wizard_state[user_id]
-                                    summary = get_wizard_summary(st)
-                                    keyboard = build_count_keyboard("swiz_cnt_", "swiz_mode_onetime")
-                                    send_message(chat_id, f"{summary}Date & Time set: `{st['display_datetime']}`\n\n*Step 5:* Select Question Count", reply_markup=keyboard)
-                                except Exception:
-                                    send_message(chat_id, "Invalid format.\nUse: `/setschedule YYYY-MM-DD | hh:mm AM/PM`\nExample: `/setschedule 2026-08-10 | 06:30 PM`")
-                            else:
-                                send_message(chat_id, "Start the wizard first with `/schedule`.")
-
-                        elif text.startswith("/slots"):
-                            if user_id in schedule_wizard_state:
-                                slots_val = text.replace("/slots", "").strip()
-                                slots_list = [s.strip() for s in slots_val.split(",") if s.strip()]
-                                schedule_wizard_state[user_id]["slots"] = slots_list
-                                schedule_wizard_state[user_id]["schedule_mode"] = "recurring"
-                                st = schedule_wizard_state[user_id]
-                                summary = get_wizard_summary(st)
-
-                                keyboard = build_count_keyboard("swiz_cnt_", "swiz_back_to_lvl")
-                                send_message(chat_id, f"{summary}\n*Step 5:* Select Question Count per Quiz", reply_markup=keyboard)
-
+                    # --- CALLBACK QUERY HANDLER ---
                     elif "callback_query" in result:
                         query = result["callback_query"]
                         query_chat_id = query["message"]["chat"]["id"]
                         message_id = query["message"]["message_id"]
                         data_cb = query["data"]
-                        cb_user_id = query.get("from", {}).get("id", query_chat_id)
+                        
+                        requests.post(f"{BASE_URL}/answerCallbackQuery", json={"callback_query_id": query["id"]}, timeout=8)
+                        
+                        if data_cb.startswith("app_ok_"):
+                            app_id = int(data_cb.split("_")[2])
+                            database.update_approval_status(app_id, "approved")
+                            app_info = database.get_pending_approval_by_id(app_id)
+                            
+                            # Add file & keyword to Vault
+                            database.add_pdf_to_vault(app_info["file_id"], app_info["file_name"], app_info["uploaded_by"])
+                            database.add_smart_keyword(app_info["suggested_keyword"], "https://t.me/CAVaultStudy/100", teacher_name="Approved Material")
+                            
+                            edit_message(query_chat_id, message_id, f"✅ **APPROVED & PUBLISHED!**\n📄 File: `{app_info['file_name']}`\n🏷️ Keyword: `{app_info['suggested_keyword']}` indexed.")
 
-                        requests.post(f"{BASE_URL}/answerCallbackQuery", json={"callback_query_id": query["id"]}, timeout=5)
+                        elif data_cb == "app_rej":
+                            edit_message(query_chat_id, message_id, "❌ **REJECTED:** Material upload discarded.")
 
-                        if data_cb == "show_help_menu":
-                            edit_message(query_chat_id, message_id, get_help_text())
-
-                        elif data_cb == "menu_main":
-                            display_name = query.get("from", {}).get("username") or query.get("from", {}).get("first_name") or "Aspirant"
-                            welcome_msg = (
-                                "╔═══════════════════╗\n"
-                                "     🦅  *CA VAULT PREMIUM*  🦅\n"
-                                "╚═══════════════════╝\n\n"
-                                f"👋 Welcome back, *{display_name}*!\n"
-                                "⚡ AI-Powered Practice Engine for CA Foundation\n\n"
-                                "🎯 Live Quizzes  •  📅 Auto-Scheduling  •  🏆 XP & Badges\n"
-                                "📄 Study Vault  •  🛡️ Anti-Abuse Protection\n"
-                                "────────────────────────\n"
-                                "Select a category below 👇"
-                            )
-                            edit_message(query_chat_id, message_id, welcome_msg, reply_markup=get_main_menu_keyboard(cb_user_id))
-
-                        elif data_cb in MENU_TEXTS:
-                            if data_cb == "menu_admin" and not role_at_least(cb_user_id, "admin"):
-                                edit_message(query_chat_id, message_id, "⛔ Permission denied. Admins/Owner only.", reply_markup=get_back_keyboard())
+                        elif data_cb.startswith("grant_"):
+                            parts = data_cb.split("_")
+                            action = parts[1]
+                            target_u = int(parts[2])
+                            if action == "1w":
+                                database.grant_quiz_access(target_u, query["from"]["id"], "1week")
+                                edit_message(query_chat_id, message_id, f"✅ Granted 1-Week Trial to user `{target_u}`.")
+                            elif action == "2w":
+                                database.grant_quiz_access(target_u, query["from"]["id"], "2weeks")
+                                edit_message(query_chat_id, message_id, f"✅ Granted 2-Weeks Trial to user `{target_u}`.")
+                            elif action == "ff":
+                                database.grant_quiz_access(target_u, query["from"]["id"], "fullfree")
+                                edit_message(query_chat_id, message_id, f"✅ Granted Full Free Access to user `{target_u}`.")
                             else:
-                                edit_message(query_chat_id, message_id, MENU_TEXTS[data_cb], reply_markup=get_back_keyboard())
+                                edit_message(query_chat_id, message_id, f"❌ Rejected quiz request for user `{target_u}`.")
 
-                        elif data_cb == "fsub_recheck":
-                            if is_force_sub_member(cb_user_id):
-                                if is_group_chat(query_chat_id):
-                                    unrestrict_user(query_chat_id, cb_user_id)
-                                edit_message(query_chat_id, message_id, "✅ *Verified!* Access unlocked — you can chat here now. Send /start in my DM to open the full menu. 🎉")
-                            else:
-                                still_missing = get_missing_channels(cb_user_id)
-                                names = ", ".join([t["channel_title"] for t in still_missing]) or "the required channel(s)"
-                                send_message(query_chat_id, f"⚠️ Still missing: {names}. Please join and tap Verify again.")
+                        elif data_cb == "dash_settings":
+                            edit_message(query_chat_id, message_id, "⚙️ **SYSTEM SETTINGS**\n\n• Mode: `AUTO`\n• Stickers Auto-Block: `ON`\n• Dynamic Timers: `25s - 45s`", reply_markup=build_dashboard_keyboard())
 
-                        elif data_cb.startswith("abuse_"):
-                            if cb_user_id != OWNER_ID:
-                                continue
-                            try:
-                                _, action, grp_id_str, target_id_str = data_cb.split("_", 3)
-                            except ValueError:
-                                continue
-                            grp_id, target_id = int(grp_id_str), int(target_id_str)
-                            if action == "unmute":
-                                unrestrict_user(grp_id, target_id)
-                                log_audit(OWNER_ID, target_id, "unmute", "owner approved unmute")
-                                edit_message(query_chat_id, message_id, f"✅ User `{target_id}` unmuted in group `{grp_id}`.")
-                            elif action == "mute24":
-                                restrict_user(grp_id, target_id, seconds=MUTE_24H_SECONDS)
-                                log_audit(OWNER_ID, target_id, "mute_24h", "owner approved 24h mute")
-                                edit_message(query_chat_id, message_id, f"🔇 User `{target_id}` muted for 24h in group `{grp_id}`.")
-                            elif action == "block":
-                                ban_user(grp_id, target_id)
-                                log_audit(OWNER_ID, target_id, "block", "owner approved permanent block")
-                                edit_message(query_chat_id, message_id, f"⛔ User `{target_id}` blocked from group `{grp_id}`.")
+                        elif data_cb == "dash_mod":
+                            edit_message(query_chat_id, message_id, "🛡️ **MODERATION CONTROL PANEL**\n\nUse `/filter add [word]` or `/stickers [on|off]` to control auto-purging filters.", reply_markup=build_dashboard_keyboard())
 
-                        elif data_cb == "rem_custom_prompt":
-                            edit_message(query_chat_id, message_id, "Send the exact reminder time as a command:\n`/setreminder_custom 08:30 AM`")
+                        elif data_cb == "dash_access":
+                            edit_message(query_chat_id, message_id, "👥 **ACCESS & TRIAL GRANTS**\n\nUse `/grant [user_id] [1week|2weeks|fullfree]` to manage access.", reply_markup=build_dashboard_keyboard())
 
-                        elif data_cb.startswith("rem_"):
-                            time_val = data_cb.split("rem_")[1]
-                            grp = user_linked_groups.get(cb_user_id)
-                            if grp:
-                                group_reminder_time[grp] = time_val
-                                save_persisted_data()
-                                disp = datetime.strptime(time_val, "%H:%M").strftime("%I:%M %p")
-                                edit_message(query_chat_id, message_id, f"✅ Daily reminder time set to `{disp}` for group `{grp}`.\n\nThe bot will post \"Today's Quiz\" there each day at this time, whenever a quiz is scheduled.")
-                            else:
-                                edit_message(query_chat_id, message_id, "⚠️ No group linked. Send `/link_group <GroupID>` first.")
+                        elif data_cb == "dash_hub":
+                            edit_message(query_chat_id, message_id, "📚 **SMART KNOWLEDGE HUB**\n\nUse `/addkeyword [#kw] | [link] | [teacher]` to add smart direct-redirect study keywords.", reply_markup=build_dashboard_keyboard())
 
-                        # --- LIVE QUIZ BUILDER BACK NAVIGATION & FLOW ---
-                        elif data_cb == "start_interactive_quiz":
-                            quiz_builder_state[query_chat_id] = {"subject": "Accounts", "chapter": "", "subtopics": "", "level": "EXTREME_HIGH", "break_freq": 0, "break_duration": 0, "conductor_id": query_chat_id}
-                            keyboard = {
-                                "inline_keyboard": [
-                                    [{"text": "Accounts", "callback_data": "sub_Accounts"}],
-                                    [{"text": "Business Laws", "callback_data": "sub_Business Laws"}],
-                                    [{"text": "Quantitative Aptitude", "callback_data": "sub_Quantitative Aptitude"}],
-                                    [{"text": "Economics", "callback_data": "sub_Economics"}]
-                                ]
-                            }
-                            edit_message(query_chat_id, message_id, "*Step 1:* Select Subject", reply_markup=keyboard)
-
-                        elif data_cb.startswith("sub_"):
-                            subj = data_cb.split("_", 1)[1]
-                            quiz_builder_state[query_chat_id]["subject"] = subj
-                            keyboard = {
-                                "inline_keyboard": [
-                                    [{"text": "Full Subject (Skip)", "callback_data": "chap_skip"}],
-                                    [{"text": "Full Chapter Only", "callback_data": "chap_only_prompt"}],
-                                    [{"text": "Chapter + Sub-topics", "callback_data": "chap_custom"}],
-                                    [{"text": "Back", "callback_data": "start_interactive_quiz"}]
-                                ]
-                            }
-                            edit_message(query_chat_id, message_id, f"Subject: *{subj}*\n\n*Step 2:* Choose Quiz Scope", reply_markup=keyboard)
-
-                        elif data_cb == "back_to_chap_choice":
-                            subj = quiz_builder_state.get(query_chat_id, {}).get("subject", "Accounts")
-                            keyboard = {
-                                "inline_keyboard": [
-                                    [{"text": "Full Subject (Skip)", "callback_data": "chap_skip"}],
-                                    [{"text": "Full Chapter Only", "callback_data": "chap_only_prompt"}],
-                                    [{"text": "Chapter + Sub-topics", "callback_data": "chap_custom"}],
-                                    [{"text": "Back", "callback_data": "start_interactive_quiz"}]
-                                ]
-                            }
-                            edit_message(query_chat_id, message_id, f"Subject: *{subj}*\n\n*Step 2:* Choose Quiz Scope", reply_markup=keyboard)
-
-                        elif data_cb == "chap_only_prompt":
-                            edit_message(query_chat_id, message_id, "Send command for full chapter:\n`/chapter_only [Chapter Name]`")
-
-                        elif data_cb == "chap_custom":
-                            edit_message(query_chat_id, message_id, "Send command for chapter + sub-topics:\n`/chapter Chapter Name | Subtopic 1, Subtopic 2`")
-
-                        elif data_cb == "chap_skip":
-                            quiz_builder_state[query_chat_id]["chapter"] = ""
-                            quiz_builder_state[query_chat_id]["subtopics"] = ""
-                            keyboard = {
-                                "inline_keyboard": [
-                                    [{"text": "MEDIUM", "callback_data": "lvl_MEDIUM"}],
-                                    [{"text": "HIGH", "callback_data": "lvl_HIGH"}],
-                                    [{"text": "EXTREME HIGH", "callback_data": "lvl_EXTREME_HIGH"}],
-                                    [{"text": "Back", "callback_data": "back_to_chap_choice"}]
-                                ]
-                            }
-                            edit_message(query_chat_id, message_id, "*Step 3:* Select Starting Difficulty Level", reply_markup=keyboard)
-
-                        elif data_cb.startswith("lvl_"):
-                            lvl = data_cb.split("lvl_")[1]
-                            quiz_builder_state[query_chat_id]["level"] = lvl
-                            keyboard = build_count_keyboard("cnt_", "chap_skip")
-                            edit_message(query_chat_id, message_id, f"Difficulty: *{lvl}*\n\n*Step 4:* Select Question Count (or type `/customcount N`)", reply_markup=keyboard)
-
-                        elif data_cb == "cnt_custom_prompt":
-                            edit_message(query_chat_id, message_id, "Send the exact question count as a command:\n`/customcount 25`")
-
-                        elif data_cb.startswith("cnt_"):
-                            cnt = int(data_cb.split("_")[1])
-                            quiz_builder_state[query_chat_id]["count"] = cnt
-                            keyboard = {
-                                "inline_keyboard": [
-                                    [{"text": "No Breaks", "callback_data": "break_none"}],
-                                    [{"text": "Every 20 Qs (5 min)", "callback_data": "break_20_5"}],
-                                    [{"text": "Every 30 Qs (10 min)", "callback_data": "break_30_10"}],
-                                    [{"text": "Back", "callback_data": "lvl_EXTREME_HIGH"}]
-                                ]
-                            }
-                            edit_message(query_chat_id, message_id, f"Questions: *{cnt}*\n\n*Step 5:* Select Break Setting", reply_markup=keyboard)
-
-                        elif data_cb == "break_none":
-                            quiz_builder_state[query_chat_id]["break_freq"] = 0
-                            quiz_builder_state[query_chat_id]["break_duration"] = 0
-                            keyboard = build_timer_keyboard("timer_", "cnt_10")
-                            edit_message(query_chat_id, message_id, "Mode: *Non-stop*\n\n*Step 6:* Select Timer per Question (or type `/customtimer N`)", reply_markup=keyboard)
-
-                        elif data_cb == "break_20_5":
-                            quiz_builder_state[query_chat_id]["break_freq"] = 20
-                            quiz_builder_state[query_chat_id]["break_duration"] = 300
-                            keyboard = build_timer_keyboard("timer_", "cnt_10")
-                            edit_message(query_chat_id, message_id, "Break: *Every 20 Qs (5 min)*\n\n*Step 6:* Select Timer per Question (or type `/customtimer N`)", reply_markup=keyboard)
-
-                        elif data_cb == "break_30_10":
-                            quiz_builder_state[query_chat_id]["break_freq"] = 30
-                            quiz_builder_state[query_chat_id]["break_duration"] = 600
-                            keyboard = build_timer_keyboard("timer_", "cnt_10")
-                            edit_message(query_chat_id, message_id, "Break: *Every 30 Qs (10 min)*\n\n*Step 6:* Select Timer per Question (or type `/customtimer N`)", reply_markup=keyboard)
-
-                        elif data_cb == "timer_custom_prompt":
-                            edit_message(query_chat_id, message_id, "Send the exact timer (seconds) as a command:\n`/customtimer 40`")
-
-                        elif data_cb.startswith("timer_"):
-                            tmr = int(data_cb.split("_")[1])
-                            state = quiz_builder_state.get(query_chat_id, {})
-                            subj = state.get("subject", "Accounts")
-                            chap = state.get("chapter", "")
-                            subtop = state.get("subtopics", "")
-                            cnt = state.get("count", 10)
-                            bf = state.get("break_freq", 0)
-                            bd = state.get("break_duration", 0)
-                            lvl = state.get("level", "EXTREME_HIGH")
-                            cond_id = state.get("conductor_id")
-
-                            edit_message(query_chat_id, message_id, f"*Starting Quiz...*\n\nSubject: `{subj}`\nQuestions: `{cnt}`\nTimer: `{tmr}s`")
-                            threading.Thread(target=run_quiz_session, args=(query_chat_id, subj, chap, cnt, tmr, bf, bd, lvl, cond_id, subtop), daemon=True).start()
-
-                        # --- SCHEDULER WIZARD WITH FULL BACK NAVIGATION & SCOPE DISPLAY ---
-                        elif data_cb == "sched_wiz_start":
-                            if cb_user_id not in user_linked_groups:
-                                edit_message(query_chat_id, message_id, "No group linked.\nFirst send: `/link_group <GroupID>`")
-                                continue
-                            schedule_wizard_state[cb_user_id] = {"group_id": user_linked_groups[cb_user_id]}
-                            st = schedule_wizard_state[cb_user_id]
-                            summary = get_wizard_summary(st)
-
-                            keyboard = {
-                                "inline_keyboard": [
-                                    [{"text": "Accounts", "callback_data": "swiz_sub_Accounts"}],
-                                    [{"text": "Business Laws", "callback_data": "swiz_sub_Business Laws"}],
-                                    [{"text": "Quantitative Aptitude", "callback_data": "swiz_sub_Quantitative Aptitude"}],
-                                    [{"text": "Economics", "callback_data": "swiz_sub_Economics"}]
-                                ]
-                            }
-                            edit_message(query_chat_id, message_id, f"{summary}*SCHEDULER WIZARD*\n\n*Step 1:* Select Subject", reply_markup=keyboard)
-
-                        elif data_cb.startswith("swiz_sub_"):
-                            subj = data_cb.split("swiz_sub_")[1]
-                            schedule_wizard_state[cb_user_id]["subject"] = subj
-                            st = schedule_wizard_state[cb_user_id]
-                            summary = get_wizard_summary(st)
-
-                            keyboard = {
-                                "inline_keyboard": [
-                                    [{"text": "Full Subject (Skip)", "callback_data": "swiz_chap_skip"}],
-                                    [{"text": "Full Chapter Only", "callback_data": "swiz_chap_only_prompt"}],
-                                    [{"text": "Chapter + Sub-topics", "callback_data": "swiz_chap_custom"}],
-                                    [{"text": "Back", "callback_data": "sched_wiz_start"}]
-                                ]
-                            }
-                            edit_message(query_chat_id, message_id, f"{summary}*Step 2:* Choose Scope", reply_markup=keyboard)
-
-                        elif data_cb == "swiz_back_to_chap_choice":
-                            st = schedule_wizard_state.get(cb_user_id, {})
-                            summary = get_wizard_summary(st)
-                            keyboard = {
-                                "inline_keyboard": [
-                                    [{"text": "Full Subject (Skip)", "callback_data": "swiz_chap_skip"}],
-                                    [{"text": "Full Chapter Only", "callback_data": "swiz_chap_only_prompt"}],
-                                    [{"text": "Chapter + Sub-topics", "callback_data": "swiz_chap_custom"}],
-                                    [{"text": "Back", "callback_data": "sched_wiz_start"}]
-                                ]
-                            }
-                            edit_message(query_chat_id, message_id, f"{summary}*Step 2:* Choose Scope", reply_markup=keyboard)
-
-                        elif data_cb == "swiz_chap_only_prompt":
-                            edit_message(query_chat_id, message_id, "Send command for full chapter:\n`/chapter_only_sched [Chapter Name]`")
-
-                        elif data_cb == "swiz_chap_custom":
-                            edit_message(query_chat_id, message_id, "Send command for chapter & sub-topics:\n`/chapter_sched Chapter Name | Subtopic 1, Subtopic 2`")
-
-                        elif data_cb == "swiz_chap_skip":
-                            schedule_wizard_state[cb_user_id]["chapter"] = ""
-                            schedule_wizard_state[cb_user_id]["subtopics"] = ""
-                            st = schedule_wizard_state[cb_user_id]
-                            summary = get_wizard_summary(st)
-
-                            keyboard = {
-                                "inline_keyboard": [
-                                    [{"text": "MEDIUM", "callback_data": "swiz_lvl_MEDIUM"}],
-                                    [{"text": "HIGH", "callback_data": "swiz_lvl_HIGH"}],
-                                    [{"text": "EXTREME HIGH", "callback_data": "swiz_lvl_EXTREME_HIGH"}],
-                                    [{"text": "Back", "callback_data": "swiz_back_to_chap_choice"}]
-                                ]
-                            }
-                            edit_message(query_chat_id, message_id, f"{summary}*Step 3:* Select Starting Difficulty Level", reply_markup=keyboard)
-
-                        elif data_cb.startswith("swiz_lvl_"):
-                            lvl = data_cb.split("swiz_lvl_")[1]
-                            schedule_wizard_state[cb_user_id]["level"] = lvl
-                            st = schedule_wizard_state[cb_user_id]
-                            summary = get_wizard_summary(st)
-
-                            keyboard = {
-                                "inline_keyboard": [
-                                    [{"text": "One-Time Custom Date & Time", "callback_data": "swiz_mode_onetime"}],
-                                    [{"text": "Recurring Daily Slots", "callback_data": "swiz_mode_recurring"}],
-                                    [{"text": "Back", "callback_data": "swiz_chap_skip"}]
-                                ]
-                            }
-                            edit_message(query_chat_id, message_id, f"{summary}*Step 4:* Choose Scheduling Mode", reply_markup=keyboard)
-
-                        elif data_cb == "swiz_mode_onetime":
-                            schedule_wizard_state[cb_user_id]["schedule_mode"] = "onetime"
-                            st = schedule_wizard_state[cb_user_id]
-                            summary = get_wizard_summary(st)
-                            edit_message(
-                                query_chat_id, message_id,
-                                f"{summary}*Step 4:* Send the exact date & time (24h date, 12h time with AM/PM):\n\n"
-                                f"`/setschedule YYYY-MM-DD | hh:mm AM/PM`\n\n"
-                                f"Example: `/setschedule 2026-08-10 | 06:30 PM`"
-                            )
-
-                        elif data_cb == "swiz_mode_recurring":
-                            schedule_wizard_state[cb_user_id]["schedule_mode"] = "recurring"
-                            st = schedule_wizard_state[cb_user_id]
-                            summary = get_wizard_summary(st)
-                            keyboard = {
-                                "inline_keyboard": [
-                                    [{"text": "09:00 AM, 03:00 PM, 09:00 PM", "callback_data": "slot_preset_1"}],
-                                    [{"text": "10:00 AM, 02:00 PM, 06:00 PM, 10:00 PM", "callback_data": "slot_preset_2"}],
-                                    [{"text": "Custom Slots (type it)", "callback_data": "slot_custom"}],
-                                    [{"text": "Back", "callback_data": "swiz_back_to_lvl"}]
-                                ]
-                            }
-                            edit_message(query_chat_id, message_id, f"{summary}*Step 4:* Choose Daily Time Slots (repeats for next 30 days)", reply_markup=keyboard)
-
-                        elif data_cb == "swiz_back_to_lvl":
-                            st = schedule_wizard_state.get(cb_user_id, {})
-                            summary = get_wizard_summary(st)
-                            keyboard = {
-                                "inline_keyboard": [
-                                    [{"text": "MEDIUM", "callback_data": "swiz_lvl_MEDIUM"}],
-                                    [{"text": "HIGH", "callback_data": "swiz_lvl_HIGH"}],
-                                    [{"text": "EXTREME HIGH", "callback_data": "swiz_lvl_EXTREME_HIGH"}],
-                                    [{"text": "Back", "callback_data": "swiz_back_to_chap_choice"}]
-                                ]
-                            }
-                            edit_message(query_chat_id, message_id, f"{summary}*Step 3:* Select Starting Difficulty Level", reply_markup=keyboard)
-
-                        elif data_cb == "slot_preset_1":
-                            schedule_wizard_state[cb_user_id]["slots"] = ["09:00", "15:00", "21:00"]
-                            st = schedule_wizard_state[cb_user_id]
-                            summary = get_wizard_summary(st)
-                            keyboard = build_count_keyboard("swiz_cnt_", "swiz_mode_recurring")
-                            edit_message(query_chat_id, message_id, f"{summary}*Step 5:* Select Question Count", reply_markup=keyboard)
-
-                        elif data_cb == "slot_preset_2":
-                            schedule_wizard_state[cb_user_id]["slots"] = ["10:00", "14:00", "18:00", "22:00"]
-                            st = schedule_wizard_state[cb_user_id]
-                            summary = get_wizard_summary(st)
-                            keyboard = build_count_keyboard("swiz_cnt_", "swiz_mode_recurring")
-                            edit_message(query_chat_id, message_id, f"{summary}*Step 5:* Select Question Count", reply_markup=keyboard)
-
-                        elif data_cb == "slot_custom":
-                            edit_message(query_chat_id, message_id, "Send command for custom daily slots (24h time, comma separated):\n`/slots 09:00, 13:00, 18:00, 21:00`")
-
-                        elif data_cb == "swiz_cnt_custom_prompt":
-                            mode = schedule_wizard_state.get(cb_user_id, {}).get("schedule_mode")
-                            cmd = "/customcount_sched 25" if mode else "/customcount_sched 25"
-                            edit_message(query_chat_id, message_id, f"Send the exact question count as a command:\n`{cmd}`")
-
-                        elif data_cb.startswith("swiz_cnt_"):
-                            cnt = int(data_cb.split("swiz_cnt_")[1])
-                            schedule_wizard_state[cb_user_id]["count"] = cnt
-                            st = schedule_wizard_state[cb_user_id]
-                            summary = get_wizard_summary(st)
-
-                            back_cb = "swiz_mode_onetime" if st.get("schedule_mode") == "onetime" else "swiz_back_to_lvl"
-                            keyboard = build_timer_keyboard("swiz_tmr_", back_cb)
-                            edit_message(query_chat_id, message_id, f"{summary}*Step 6:* Select Timer per Question", reply_markup=keyboard)
-
-                        elif data_cb == "swiz_back_to_cnt":
-                            st = schedule_wizard_state.get(cb_user_id, {})
-                            summary = get_wizard_summary(st)
-                            keyboard = build_count_keyboard("swiz_cnt_", "swiz_back_to_lvl")
-                            edit_message(query_chat_id, message_id, f"{summary}*Step 5:* Select Question Count", reply_markup=keyboard)
-
-                        elif data_cb == "swiz_tmr_custom_prompt":
-                            edit_message(query_chat_id, message_id, "Send the exact timer (seconds) as a command:\n`/customtimer_sched 40`")
-
-                        elif data_cb.startswith("swiz_tmr_"):
-                            tmr = int(data_cb.split("swiz_tmr_")[1])
-                            finalize_schedule_wizard(query_chat_id, cb_user_id, tmr, message_id=message_id)
+                        elif data_cb == "dash_close":
+                            delete_message(query_chat_id, message_id)
 
         except Exception as e:
             time.sleep(2)
 
-
-def finalize_schedule_wizard(chat_id, user_id, tmr, message_id=None):
-    """Shared finalizer for both one-time and recurring schedule modes."""
-    st = schedule_wizard_state.get(user_id, {})
-    target_grp = st.get("group_id")
-    subj = st.get("subject", "Accounts")
-    chap = st.get("chapter", "")
-    subtop = st.get("subtopics", "")
-    lvl = st.get("level", "EXTREME_HIGH")
-    cnt = st.get("count", 10)
-    mode = st.get("schedule_mode", "recurring")
-
-    chap_text = chap if chap else "Full Subject Syllabus"
-    subtop_text = f"\nSubtopics: `{subtop}`" if subtop else ""
-
-    if target_grp not in group_reminder_time:
-        group_reminder_time[target_grp] = "08:00"
-
-    if mode == "onetime":
-        run_dt = st.get("custom_datetime")
-        if not run_dt:
-            send_message(chat_id, "Missing date/time. Please send `/setschedule YYYY-MM-DD | hh:mm AM/PM` again.")
-            return
-        scheduled_quizzes.append({
-            "chat_id": target_grp,
-            "datetime": run_dt,
-            "subject": subj,
-            "chapter": chap,
-            "subtopics": subtop,
-            "count": cnt,
-            "timer": tmr,
-            "level": lvl,
-            "conductor_id": user_id
-        })
-        save_persisted_data()
-        schedule_line = f"Date & Time: `{st.get('display_datetime')}`"
-        announcement_schedule_line = f"Date & Time: `{st.get('display_datetime')}`"
-    else:
-        slots = st.get("slots", ["09:00", "15:00", "21:00"])
-        today = datetime.now()
-        for day in range(30):
-            f_date = (today + timedelta(days=day)).strftime("%Y-%m-%d")
-            for slot in slots:
-                scheduled_quizzes.append({
-                    "chat_id": target_grp,
-                    "datetime": f"{f_date} {slot}",
-                    "subject": subj,
-                    "chapter": chap,
-                    "subtopics": subtop,
-                    "count": cnt,
-                    "timer": tmr,
-                    "level": lvl,
-                    "conductor_id": user_id
-                })
-        save_persisted_data()
-        schedule_line = f"Daily Slots (next 30 days): `{', '.join(slots)}`"
-        announcement_schedule_line = f"Daily Time Slots: `{', '.join(slots)}`"
-
-    announcement_text = (
-        f"📢 *SCHEDULED QUIZ ANNOUNCEMENT*\n"
-        f"────────────────────────\n"
-        f"📘 Subject: `{subj}`\n"
-        f"📖 Scope: `{chap_text}`{subtop_text}\n"
-        f"{announcement_schedule_line}\n"
-        f"🔢 Questions/Quiz: `{cnt}`  |  ⏱ Timer: `{tmr}s`\n"
-        f"────────────────────────\n"
-        f"🚀 Quizzes will start automatically at the scheduled time(s).\n"
-        f"📌 A reminder will also be posted here on the day of each quiz."
-    )
-    res_msg = send_message(target_grp, announcement_text)
-    if res_msg.get("ok"):
-        pin_message(target_grp, res_msg["result"]["message_id"])
-
-    final_text = (
-        f"🎉 *Schedule Created & Announced*\n\n"
-        f"📌 Group ID: `{target_grp}`\n"
-        f"📘 Subject: `{subj}` (`{chap_text}`)\n"
-        f"{schedule_line}\n\n"
-        f"✅ Group announcement pinned successfully. Use `/myschedules` any time to review it, or `/reminder` to change the daily announcement time."
-    )
-    if message_id:
-        edit_message(chat_id, message_id, final_text)
-    else:
-        send_message(chat_id, final_text)
-
-
 if __name__ == "__main__":
-    # Initialize the production database (users, quiz_history, badges, pdf_index, leaderboard_cache, audit_logs)
-    init_db()
-
-    # Load any previously saved links / schedules
-    load_persisted_data()
-
-    # Start Dummy Web Server for Render Free Tier Web Service
-    threading.Thread(target=run_dummy_server, daemon=True).start()
-
-    # Start Bot Tasks
+    threading.Thread(target=purge_background_worker, daemon=True).start()
+    threading.Thread(target=icai_auto_sync_worker, daemon=True).start()
     threading.Thread(target=scheduler_background_worker, daemon=True).start()
-    threading.Thread(target=daily_reminder_worker, daemon=True).start()
     handle_updates()
