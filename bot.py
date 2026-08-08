@@ -26,9 +26,10 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # --- NEW: Production Pillars Config ---
-FORCE_SUB_CHANNEL = os.getenv("FORCE_SUB_CHANNEL", "")          # e.g. "@ca_vault_channel" — leave blank to disable
-FORCE_SUB_CHANNEL_LINK = os.getenv("FORCE_SUB_CHANNEL_LINK", "")  # public invite link shown to users
+FORCE_SUB_CHANNEL = os.getenv("FORCE_SUB_CHANNEL", "")          # e.g. "@ca_vault_channel" — legacy single channel via env (still supported)
+FORCE_SUB_CHANNEL_LINK = os.getenv("FORCE_SUB_CHANNEL_LINK", "")  # public invite link shown to users (for the env channel above)
 PDF_VAULT_CHANNEL_ID = os.getenv("PDF_VAULT_CHANNEL_ID", "")     # numeric channel id (as string) bot must be admin of
+GROUP_INVITE_LINK = os.getenv("GROUP_INVITE_LINK", "")           # optional fallback group invite link shown on /refer
 
 XP_CORRECT = 4
 XP_WRONG = -1
@@ -222,9 +223,41 @@ def init_db():
             reason TEXT,
             timestamp TEXT
         )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS force_channels (
+            channel_id TEXT PRIMARY KEY,
+            channel_title TEXT,
+            invite_link TEXT,
+            added_by INTEGER,
+            added_at TEXT
+        )""")
         conn.commit()
         conn.close()
-        print("Database initialized (users, quiz_history, badges, pdf_index, leaderboard_cache, audit_logs).")
+        print("Database initialized (users, quiz_history, badges, pdf_index, leaderboard_cache, audit_logs, force_channels).")
+
+def add_force_channel(channel_id, channel_title, invite_link, added_by):
+    with _db_lock:
+        conn = get_db()
+        conn.execute(
+            "INSERT OR REPLACE INTO force_channels (channel_id, channel_title, invite_link, added_by, added_at) VALUES (?,?,?,?,?)",
+            (channel_id, channel_title, invite_link, added_by, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        )
+        conn.commit()
+        conn.close()
+    log_audit(added_by, 0, "channel_add", f"{channel_id} ({channel_title})")
+
+def remove_force_channel(channel_id, removed_by):
+    with _db_lock:
+        conn = get_db()
+        conn.execute("DELETE FROM force_channels WHERE channel_id=?", (channel_id,))
+        conn.commit()
+        conn.close()
+    log_audit(removed_by, 0, "channel_remove", channel_id)
+
+def get_force_channels():
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM force_channels ORDER BY added_at ASC").fetchall()
+    conn.close()
+    return rows
 
 def log_audit(admin_id, target_user_id, action_type, reason=""):
     with _db_lock:
@@ -458,22 +491,62 @@ def handle_abuse_violation(chat_id, user_id, username, message_text):
         reply_markup=keyboard
     )
 
-def is_force_sub_member(user_id):
-    if not FORCE_SUB_CHANNEL:
-        return True
-    try:
-        res = requests.get(f"{BASE_URL}/getChatMember", params={"chat_id": FORCE_SUB_CHANNEL, "user_id": user_id}, timeout=5)
-        data = res.json()
-        if data.get("ok"):
-            return data["result"]["status"] in ["creator", "administrator", "member"]
-    except Exception:
-        return True  # fail-open so bot doesn't lock everyone out on API hiccups
-    return True
+def get_all_force_sub_targets():
+    """Returns every channel the user must be a member of: legacy env channel + all DB-added channels."""
+    targets = []
+    if FORCE_SUB_CHANNEL:
+        targets.append({
+            "channel_id": FORCE_SUB_CHANNEL,
+            "channel_title": "Official Channel",
+            "invite_link": FORCE_SUB_CHANNEL_LINK or f"https://t.me/{FORCE_SUB_CHANNEL.lstrip('@')}"
+        })
+    for row in get_force_channels():
+        targets.append({
+            "channel_id": row["channel_id"],
+            "channel_title": row["channel_title"] or row["channel_id"],
+            "invite_link": row["invite_link"] or (f"https://t.me/{row['channel_id'].lstrip('@')}" if str(row["channel_id"]).startswith("@") else "")
+        })
+    return targets
 
-def prompt_force_subscribe(chat_id, user_id):
-    keyboard = {"inline_keyboard": [[{"text": "📢 Join Channel", "url": FORCE_SUB_CHANNEL_LINK or f"https://t.me/{FORCE_SUB_CHANNEL.lstrip('@')}"}],
-                                     [{"text": "✅ I've Joined", "callback_data": "fsub_recheck"}]]}
-    send_message(chat_id, "🔒 *Access Restricted*\n\nPlease join our official announcement channel to continue using the bot.", reply_markup=keyboard)
+def get_missing_channels(user_id):
+    """Returns the list of force-sub targets this user has NOT joined yet."""
+    missing = []
+    for t in get_all_force_sub_targets():
+        try:
+            res = requests.get(f"{BASE_URL}/getChatMember", params={"chat_id": t["channel_id"], "user_id": user_id}, timeout=5)
+            data = res.json()
+            if data.get("ok"):
+                if data["result"]["status"] not in ["creator", "administrator", "member"]:
+                    missing.append(t)
+            # if the API call fails (bot not admin there, etc.) we fail-open for THAT channel
+        except Exception:
+            pass
+    return missing
+
+def is_force_sub_member(user_id):
+    if not get_all_force_sub_targets():
+        return True
+    return len(get_missing_channels(user_id)) == 0
+
+def prompt_force_subscribe(send_to_chat_id, user_id, missing=None, mention=""):
+    """Sends a locked-access card with a Join button per missing channel + a Verify button.
+    send_to_chat_id can be the group itself (so the user is redirected straight there) or the user's DM."""
+    if missing is None:
+        missing = get_missing_channels(user_id)
+    if not missing:
+        return
+    buttons = [[{"text": f"📢 Join {t['channel_title']}", "url": t["invite_link"]}] for t in missing if t.get("invite_link")]
+    buttons.append([{"text": "✅ I've Joined — Verify", "callback_data": "fsub_recheck"}])
+    keyboard = {"inline_keyboard": buttons}
+    header = f"🔒 *ACCESS LOCKED* — {mention}" if mention else "🔒 *ACCESS LOCKED*"
+    text = (
+        f"{header}\n"
+        f"────────────────────────\n"
+        f"To chat here / use the bot, please join the channel(s) below first.\n"
+        f"Once joined, tap *✅ I've Joined — Verify* to unlock instantly.\n"
+        f"────────────────────────"
+    )
+    send_message(send_to_chat_id, text, reply_markup=keyboard)
 
 def set_focus_mode(chat_id, enable):
     """Mutes/unmutes the whole group's default permission during a live quiz to stop spam."""
@@ -869,14 +942,96 @@ def get_help_text():
         "🎮 *Gamification*\n"
         "▸ `/profile` — XP, Level, Streak & Badges\n"
         "▸ `/leaderboard [daily|weekly|monthly|alltime]` — Top rankers\n"
-        "▸ `/refer` — Get your referral link (+20 XP per join)\n\n"
+        "▸ `/refer` — Get your referral + group invite link (+20 XP per join)\n\n"
         "📄 *Study Vault*\n"
         "▸ `/addpdf` — Reply to a PDF to index it into the Study Vault channel\n\n"
+        "🔒 *Force-Subscribe*\n"
+        "▸ `/channels` — View all mandatory-join channels\n\n"
         "🛡️ *Admin/Owner Only*\n"
         "▸ `/setrole <user_id> <student|moderator|admin|owner>`\n"
-        "▸ `/audit` — View recent moderation/audit logs\n\n"
+        "▸ `/audit` — View recent moderation/audit logs\n"
+        "▸ `/addchannel <@channel or -100ID> | <link>` — Add a mandatory-join channel\n"
+        "▸ `/removechannel <@channel or -100ID>` — Remove a mandatory-join channel\n\n"
         "📊 *After every quiz:* a full performance report is DM'd to whoever started it."
     )
+
+# --- PREMIUM BOXED MAIN MENU (Rose-bot style categorized panel) ---
+def get_main_menu_keyboard(user_id):
+    buttons = [
+        [{"text": "🎯 Quiz Zone", "callback_data": "menu_quiz"}, {"text": "📅 Scheduler", "callback_data": "menu_schedule"}],
+        [{"text": "🎮 Gamification", "callback_data": "menu_game"}, {"text": "📄 Study Vault", "callback_data": "menu_vault"}],
+        [{"text": "📢 Channels", "callback_data": "menu_channels"}, {"text": "ℹ️ About", "callback_data": "menu_about"}],
+    ]
+    if role_at_least(user_id, "admin"):
+        buttons.append([{"text": "🛡️ Admin Panel", "callback_data": "menu_admin"}])
+    return {"inline_keyboard": buttons}
+
+def get_back_keyboard():
+    return {"inline_keyboard": [[{"text": "🔙 Back to Menu", "callback_data": "menu_main"}]]}
+
+MENU_TEXTS = {
+    "menu_quiz": (
+        "🎯 *QUIZ ZONE*\n"
+        "────────────────────────\n"
+        "▸ `/quiz` — Launch interactive live quiz setup *(inside a group)*\n"
+        "▸ `/stopquiz` — Stop the currently running quiz\n"
+        "▸ `/myid` — Show a chat's Chat ID\n"
+        "────────────────────────\n"
+        "🔥 AI-generated, ICAI-tagged questions with auto-adjusting difficulty."
+    ),
+    "menu_schedule": (
+        "📅 *SCHEDULER*\n"
+        "────────────────────────\n"
+        "▸ `/link_group <GroupID>` — Link your group once, forever\n"
+        "▸ `/schedule` — Guided wizard: one-time or recurring daily slots\n"
+        "▸ `/myschedules` — View your upcoming scheduled quizzes\n"
+        "▸ `/reminder` — Set the daily \"Today's Quiz\" announcement time\n"
+        "────────────────────────\n"
+        "💡 Use this in the bot's *DM*, not inside the group."
+    ),
+    "menu_game": (
+        "🎮 *GAMIFICATION*\n"
+        "────────────────────────\n"
+        "▸ `/profile` — XP, Level, Streak & Badges\n"
+        "▸ `/leaderboard [daily|weekly|monthly|alltime]` — Top rankers\n"
+        "▸ `/refer` — Get your referral + group invite link (+20 XP/join)\n"
+        "────────────────────────\n"
+        "🏅 Earn badges for streaks, XP milestones & quiz consistency."
+    ),
+    "menu_vault": (
+        "📄 *STUDY VAULT*\n"
+        "────────────────────────\n"
+        "▸ `/addpdf` — Reply to a PDF with this command to index it\n"
+        "────────────────────────\n"
+        "📚 All indexed PDFs are archived in the Study Vault channel."
+    ),
+    "menu_channels": (
+        "📢 *MANDATORY CHANNELS*\n"
+        "────────────────────────\n"
+        "▸ `/channels` — View every channel you must join to use the bot\n"
+        "────────────────────────\n"
+        "🔒 You must be a member of all listed channels to chat in linked groups."
+    ),
+    "menu_about": (
+        "ℹ️ *ABOUT CA VAULT*\n"
+        "────────────────────────\n"
+        "🦅 AI-powered, high-yield practice engine for CA Foundation.\n"
+        "⚡ 5-layer AI failover for zero-downtime question generation.\n"
+        "🛡️ Built-in anti-abuse, roles, audit logs & force-subscribe.\n"
+        "────────────────────────\n"
+        "Made for serious aspirants. Good luck! 🎯"
+    ),
+    "menu_admin": (
+        "🛡️ *ADMIN PANEL*\n"
+        "────────────────────────\n"
+        "▸ `/setrole <user_id> <role>` — student / moderator / admin / owner\n"
+        "▸ `/audit` — Recent moderation/audit logs\n"
+        "▸ `/addchannel <@channel or -100ID> | <link>` — Add mandatory channel\n"
+        "▸ `/removechannel <@channel or -100ID>` — Remove mandatory channel\n"
+        "────────────────────────\n"
+        "Admins & Owner only."
+    ),
+}
 
 # --- WIZARD HELPER TO BUILD SUMMARY TEXT ---
 def get_wizard_summary(st):
@@ -989,9 +1144,21 @@ def handle_updates():
                         if user_id:
                             ensure_user(user_id, username)
 
-                        # --- FORCE SUBSCRIBE GATE (skips owner/admins and non-command chatter checks) ---
-                        if FORCE_SUB_CHANNEL and user_id and user_id != OWNER_ID and not is_force_sub_member(user_id):
-                            prompt_force_subscribe(chat_id, user_id)
+                        # --- FORCE SUBSCRIBE GATE (skips owner/admins) ---
+                        if user_id and user_id != OWNER_ID and get_all_force_sub_targets() and not is_force_sub_member(user_id):
+                            missing = get_missing_channels(user_id)
+                            if is_group_chat(chat_id):
+                                # Mute the user in this group so they literally cannot send messages until verified,
+                                # delete their message to keep the group clean, and send them straight to the channel(s).
+                                restrict_user(chat_id, user_id)
+                                try:
+                                    requests.post(f"{BASE_URL}/deleteMessage", json={"chat_id": chat_id, "message_id": message["message_id"]}, timeout=5)
+                                except Exception:
+                                    pass
+                                mention = f"[{username or 'there'}](tg://user?id={user_id})"
+                                prompt_force_subscribe(chat_id, user_id, missing=missing, mention=mention)
+                            else:
+                                prompt_force_subscribe(chat_id, user_id, missing=missing)
                             continue
 
                         # --- ANTI-ABUSE KEYWORD SCAN (group messages only, skip admins/owner) ---
@@ -1066,7 +1233,22 @@ def handle_updates():
                             row = get_user_row(user_id)
                             bot_username = os.getenv("BOT_USERNAME", "")
                             link = f"https://t.me/{bot_username}?start=ref_{row['referral_code']}" if bot_username else f"Referral Code: `{row['referral_code']}`"
-                            send_message(chat_id, f"🎁 *Your Referral Shield*\n\nInvite friends using this link — you earn `+{XP_REFERRAL_BONUS} XP` per join:\n{link}")
+                            grp_link = None
+                            linked_grp = user_linked_groups.get(user_id)
+                            if linked_grp:
+                                try:
+                                    exp_res = requests.post(f"{BASE_URL}/exportChatInviteLink", json={"chat_id": linked_grp}, timeout=5).json()
+                                    if exp_res.get("ok"):
+                                        grp_link = exp_res["result"]
+                                except Exception:
+                                    pass
+                            if not grp_link and GROUP_INVITE_LINK:
+                                grp_link = GROUP_INVITE_LINK
+                            group_line = f"\n👥 *Group Invite Link:*\n{grp_link}" if grp_link else ""
+                            send_message(chat_id,
+                                f"🎁 *Your Referral Shield*\n────────────────────────\n"
+                                f"Invite friends using your personal bot link — you earn `+{XP_REFERRAL_BONUS} XP` per join:\n{link}{group_line}\n"
+                                f"────────────────────────\n💡 Share both links so friends join the group AND get XP-tracked here.")
                             continue
 
                         elif text.startswith("/setrole"):
@@ -1100,21 +1282,77 @@ def handle_updates():
                             send_message(chat_id, "\n".join(lines))
                             continue
 
+                        elif text.startswith("/addchannel"):
+                            if not role_at_least(user_id, "admin"):
+                                send_message(chat_id, "Permission denied. Admins/Owner only.")
+                                continue
+                            raw = text.replace("/addchannel", "").strip()
+                            if not raw:
+                                send_message(chat_id, "Usage: `/addchannel <@channelusername or -100ChannelID> | <Optional Invite Link>`\n\nExample: `/addchannel @ca_vault_updates`")
+                                continue
+                            parts = raw.split("|")
+                            chan_id = parts[0].strip()
+                            invite_link = parts[1].strip() if len(parts) > 1 else ""
+                            title = chan_id
+                            try:
+                                info = requests.get(f"{BASE_URL}/getChat", params={"chat_id": chan_id}, timeout=5).json()
+                                if info.get("ok"):
+                                    title = info["result"].get("title", chan_id)
+                                    if not invite_link:
+                                        invite_link = info["result"].get("invite_link", "") or ""
+                            except Exception:
+                                pass
+                            if not invite_link and chan_id.startswith("@"):
+                                invite_link = f"https://t.me/{chan_id.lstrip('@')}"
+                            add_force_channel(chan_id, title, invite_link, user_id)
+                            send_message(chat_id,
+                                f"✅ *Force-Subscribe Channel Added*\n────────────────────────\n"
+                                f"📢 Title: `{title}`\n🆔 ID: `{chan_id}`\n🔗 Link: {invite_link or 'Not set — add one manually if joins fail'}\n\n"
+                                f"⚠️ Make sure the bot is an *admin* of that channel, otherwise membership checks will silently fail-open.")
+                            continue
+
+                        elif text.startswith("/removechannel"):
+                            if not role_at_least(user_id, "admin"):
+                                send_message(chat_id, "Permission denied. Admins/Owner only.")
+                                continue
+                            chan_id = text.replace("/removechannel", "").strip()
+                            if not chan_id:
+                                send_message(chat_id, "Usage: `/removechannel <@channelusername or -100ChannelID>`")
+                                continue
+                            remove_force_channel(chan_id, user_id)
+                            send_message(chat_id, f"✅ Removed `{chan_id}` from the Force-Subscribe list.")
+                            continue
+
+                        elif text.startswith("/channels"):
+                            targets = get_all_force_sub_targets()
+                            if not targets:
+                                send_message(chat_id, "No force-subscribe channels configured yet.\nAdd one with `/addchannel <@channel or -100ID>`.")
+                                continue
+                            lines = ["📢 *FORCE-SUBSCRIBE CHANNELS*", "────────────────────────"]
+                            for t in targets:
+                                lines.append(f"• *{t['channel_title']}* — `{t['channel_id']}`")
+                            lines.append("────────────────────────")
+                            lines.append("Users must join ALL of the above to use the bot / chat in linked groups.")
+                            send_message(chat_id, "\n".join(lines))
+                            continue
+
                         if text.startswith("/start"):
                             payload = text.replace("/start", "").strip()
                             if payload.startswith("ref_"):
                                 process_referral(user_id, payload.replace("ref_", "").strip())
+                            display_name = username or "Aspirant"
                             welcome_msg = (
-                                "🦅 *Welcome to CA Vault Quiz Engine*\n\n"
-                                "⚡ High-yield, AI-generated practice quizzes for CA Foundation.\n\n"
-                                "Tap below to open the control menu 👇"
+                                "╔═══════════════════╗\n"
+                                "     🦅  *CA VAULT PREMIUM*  🦅\n"
+                                "╚═══════════════════╝\n\n"
+                                f"👋 Welcome, *{display_name}*!\n"
+                                "⚡ AI-Powered Practice Engine for CA Foundation\n\n"
+                                "🎯 Live Quizzes  •  📅 Auto-Scheduling  •  🏆 XP & Badges\n"
+                                "📄 Study Vault  •  🛡️ Anti-Abuse Protection\n"
+                                "────────────────────────\n"
+                                "Select a category below to get started 👇"
                             )
-                            keyboard = {
-                                "inline_keyboard": [
-                                    [{"text": "📖 Open Help Menu", "callback_data": "show_help_menu"}]
-                                ]
-                            }
-                            send_message(chat_id, welcome_msg, reply_markup=keyboard)
+                            send_message(chat_id, welcome_msg, reply_markup=get_main_menu_keyboard(user_id))
 
                         elif text.startswith("/help"):
                             keyboard = {
@@ -1433,11 +1671,36 @@ def handle_updates():
                         if data_cb == "show_help_menu":
                             edit_message(query_chat_id, message_id, get_help_text())
 
+                        elif data_cb == "menu_main":
+                            display_name = query.get("from", {}).get("username") or query.get("from", {}).get("first_name") or "Aspirant"
+                            welcome_msg = (
+                                "╔═══════════════════╗\n"
+                                "     🦅  *CA VAULT PREMIUM*  🦅\n"
+                                "╚═══════════════════╝\n\n"
+                                f"👋 Welcome back, *{display_name}*!\n"
+                                "⚡ AI-Powered Practice Engine for CA Foundation\n\n"
+                                "🎯 Live Quizzes  •  📅 Auto-Scheduling  •  🏆 XP & Badges\n"
+                                "📄 Study Vault  •  🛡️ Anti-Abuse Protection\n"
+                                "────────────────────────\n"
+                                "Select a category below 👇"
+                            )
+                            edit_message(query_chat_id, message_id, welcome_msg, reply_markup=get_main_menu_keyboard(cb_user_id))
+
+                        elif data_cb in MENU_TEXTS:
+                            if data_cb == "menu_admin" and not role_at_least(cb_user_id, "admin"):
+                                edit_message(query_chat_id, message_id, "⛔ Permission denied. Admins/Owner only.", reply_markup=get_back_keyboard())
+                            else:
+                                edit_message(query_chat_id, message_id, MENU_TEXTS[data_cb], reply_markup=get_back_keyboard())
+
                         elif data_cb == "fsub_recheck":
                             if is_force_sub_member(cb_user_id):
-                                edit_message(query_chat_id, message_id, "✅ Verified! You now have full access. Send /start to open the menu.")
+                                if is_group_chat(query_chat_id):
+                                    unrestrict_user(query_chat_id, cb_user_id)
+                                edit_message(query_chat_id, message_id, "✅ *Verified!* Access unlocked — you can chat here now. Send /start in my DM to open the full menu. 🎉")
                             else:
-                                send_message(query_chat_id, "⚠️ Still not detected as a member. Please join the channel first.")
+                                still_missing = get_missing_channels(cb_user_id)
+                                names = ", ".join([t["channel_title"] for t in still_missing]) or "the required channel(s)"
+                                send_message(query_chat_id, f"⚠️ Still missing: {names}. Please join and tap Verify again.")
 
                         elif data_cb.startswith("abuse_"):
                             if cb_user_id != OWNER_ID:
