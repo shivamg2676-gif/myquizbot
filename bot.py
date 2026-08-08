@@ -612,8 +612,8 @@ def purge_background_worker():
             for msg in pending:
                 delete_message(msg["chat_id"], msg["message_id"])
                 database.delete_purge_message_entry(msg["id"])
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"⚠️ [purge_background_worker] {type(e).__name__}: {e}", flush=True)
         time.sleep(5)
 
 def icai_auto_sync_worker():
@@ -621,8 +621,8 @@ def icai_auto_sync_worker():
         try:
             now_str = datetime.now().strftime("%Y-%m-%d")
             database.log_audit(0, 0, "ICAI_SYNC_CHECK", f"Scraped BoS Portal for {now_str}")
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"⚠️ [icai_auto_sync_worker] {type(e).__name__}: {e}", flush=True)
         time.sleep(21600)
 
 def scheduler_background_worker():
@@ -687,8 +687,8 @@ def scheduler_background_worker():
                     threading.Thread(target=run_quiz_session, args=(job["chat_id"], job["subject"], job["chapter"], job["count"], job["timer"], job.get("break_freq", 0), job.get("break_duration", 0), job.get("level", "EXTREME_HIGH")), daemon=True).start()
                     database.delete_scheduled_quiz(job["id"])
 
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"⚠️ [scheduler_background_worker] {type(e).__name__}: {e}", flush=True)
         time.sleep(15)
 
 def build_dashboard_keyboard():
@@ -790,9 +790,34 @@ def build_main_home_ui(first_name, linked_group_id=None):
     }
     return text, kb
 
+def verify_bot_token_and_clear_webhook():
+    if not BASE_URL:
+        print("❌ FATAL: BOT_TOKEN env var is missing or empty. Bot cannot start.", flush=True)
+        return False
+    try:
+        me = requests.get(f"{BASE_URL}/getMe", timeout=10).json()
+        if not me.get("ok"):
+            print(f"❌ FATAL: Invalid BOT_TOKEN — Telegram rejected getMe(): {me}", flush=True)
+            return False
+        print(f"✅ Bot Authenticated: @{me['result'].get('username')} (id={me['result'].get('id')})", flush=True)
+    except Exception as e:
+        print(f"❌ FATAL: Could not reach Telegram API for getMe(): {e}", flush=True)
+        return False
+    try:
+        wh = requests.post(f"{BASE_URL}/deleteWebhook", json={"drop_pending_updates": False}, timeout=10).json()
+        print(f"ℹ️ deleteWebhook result: {wh}", flush=True)
+    except Exception as e:
+        print(f"⚠️ Could not clear webhook (non-fatal): {e}", flush=True)
+    return True
+
 def handle_updates():
     offset = 0
     print("🤖 Telegram Bot Polling Engine Online...")
+
+    if not verify_bot_token_and_clear_webhook():
+        print("🛑 Polling loop will retry token/webhook checks every 10s until fixed.", flush=True)
+        while not verify_bot_token_and_clear_webhook():
+            time.sleep(10)
 
     while True:
         try:
@@ -803,6 +828,18 @@ def handle_updates():
 
             response = requests.get(f"{BASE_URL}/getUpdates", params={"offset": offset, "timeout": 10}, timeout=12)
             data = response.json()
+
+            if not data.get("ok"):
+                print(f"⚠️ [getUpdates FAILED] {data.get('error_code')}: {data.get('description')}", flush=True)
+                if data.get("error_code") == 409:
+                    # Another poller (or an active webhook) is fighting for updates.
+                    # Force-clear any webhook so long-polling can take over cleanly.
+                    try:
+                        requests.post(f"{BASE_URL}/deleteWebhook", json={"drop_pending_updates": False}, timeout=8)
+                    except Exception:
+                        pass
+                time.sleep(3)
+                continue
 
             if data.get("ok"):
                 for result in data.get("result", []):
@@ -1536,6 +1573,7 @@ def handle_updates():
                             delete_message(query_chat_id, message_id)
 
         except Exception as e:
+            print(f"⚠️ [POLLING LOOP ERROR] {type(e).__name__}: {e}", flush=True)
             time.sleep(2)
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
