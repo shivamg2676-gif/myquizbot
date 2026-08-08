@@ -2,6 +2,9 @@ import os
 import sys
 import time
 import json
+import sqlite3
+import secrets
+import re
 from datetime import datetime, timedelta
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -19,6 +22,21 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+# OpenAI (added as an additional free-tier-compatible layer, per blueprint "Add both open ai")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# --- NEW: Production Pillars Config ---
+FORCE_SUB_CHANNEL = os.getenv("FORCE_SUB_CHANNEL", "")          # e.g. "@ca_vault_channel" — leave blank to disable
+FORCE_SUB_CHANNEL_LINK = os.getenv("FORCE_SUB_CHANNEL_LINK", "")  # public invite link shown to users
+PDF_VAULT_CHANNEL_ID = os.getenv("PDF_VAULT_CHANNEL_ID", "")     # numeric channel id (as string) bot must be admin of
+
+XP_CORRECT = 4
+XP_WRONG = -1
+XP_REFERRAL_BONUS = 20
+LEVEL_XP_STEP = 100  # XP needed per level
+
+BANNED_WORDS = [w.strip().lower() for w in os.getenv("BANNED_WORDS", "").split(",") if w.strip()]
+MUTE_24H_SECONDS = 24 * 60 * 60
 
 scheduled_quizzes = []
 active_poll_tracker = {}
@@ -133,6 +151,337 @@ def save_persisted_data():
                 }, f)
         except Exception as e:
             print(f"Could not save persisted data: {e}")
+
+# ============================================================================
+# --- PRODUCTION-READY DATABASE LAYER (SQLite) ---
+# Pillars: A) Roles  B) Users/QuizHistory/Badges/PDFIndex/Leaderboard  C) Audit Logs
+# ============================================================================
+DB_FILE = os.getenv("DB_FILE", "ca_vault.db")
+_db_lock = threading.Lock()
+
+def get_db():
+    conn = sqlite3.connect(DB_FILE, timeout=10, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    with _db_lock:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("""CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            role TEXT DEFAULT 'student',
+            xp INTEGER DEFAULT 0,
+            level INTEGER DEFAULT 1,
+            streak_count INTEGER DEFAULT 0,
+            last_active_date TEXT,
+            referred_by INTEGER,
+            referral_code TEXT UNIQUE,
+            joined_date TEXT
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS quiz_history (
+            attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            subject TEXT,
+            chapter TEXT,
+            score INTEGER,
+            correct_count INTEGER,
+            wrong_count INTEGER,
+            time_taken INTEGER,
+            timestamp TEXT
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS badges (
+            badge_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            badge_name TEXT,
+            earned_at TEXT,
+            UNIQUE(user_id, badge_name)
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS pdf_index (
+            pdf_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id TEXT,
+            file_name TEXT,
+            uploaded_by INTEGER,
+            timestamp TEXT,
+            channel_message_id INTEGER
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS leaderboard_cache (
+            user_id INTEGER,
+            period TEXT,
+            periodic_score INTEGER,
+            rank INTEGER,
+            updated_at TEXT,
+            PRIMARY KEY (user_id, period)
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS audit_logs (
+            log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_id INTEGER,
+            target_user_id INTEGER,
+            action_type TEXT,
+            reason TEXT,
+            timestamp TEXT
+        )""")
+        conn.commit()
+        conn.close()
+        print("Database initialized (users, quiz_history, badges, pdf_index, leaderboard_cache, audit_logs).")
+
+def log_audit(admin_id, target_user_id, action_type, reason=""):
+    with _db_lock:
+        conn = get_db()
+        conn.execute(
+            "INSERT INTO audit_logs (admin_id, target_user_id, action_type, reason, timestamp) VALUES (?,?,?,?,?)",
+            (admin_id, target_user_id, action_type, reason, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        )
+        conn.commit()
+        conn.close()
+
+def ensure_user(user_id, username=""):
+    with _db_lock:
+        conn = get_db()
+        row = conn.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,)).fetchone()
+        if not row:
+            role = "owner" if user_id == OWNER_ID else "student"
+            ref_code = secrets.token_hex(4)
+            conn.execute(
+                "INSERT INTO users (user_id, username, role, xp, level, streak_count, last_active_date, referral_code, joined_date) VALUES (?,?,?,?,?,?,?,?,?)",
+                (user_id, username, role, 0, 1, 0, "", ref_code, datetime.now().strftime("%Y-%m-%d"))
+            )
+            conn.commit()
+        elif username:
+            conn.execute("UPDATE users SET username=? WHERE user_id=?", (username, user_id))
+            conn.commit()
+        conn.close()
+
+def get_user_row(user_id):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+    conn.close()
+    return row
+
+def get_role(user_id):
+    if user_id == OWNER_ID:
+        return "owner"
+    row = get_user_row(user_id)
+    return row["role"] if row else "student"
+
+def set_role(target_user_id, new_role, set_by):
+    ensure_user(target_user_id)
+    with _db_lock:
+        conn = get_db()
+        conn.execute("UPDATE users SET role=? WHERE user_id=?", (new_role, target_user_id))
+        conn.commit()
+        conn.close()
+    log_audit(set_by, target_user_id, "role_change", f"role set to {new_role}")
+
+ROLE_RANK = {"student": 0, "moderator": 1, "admin": 2, "owner": 3}
+
+def role_at_least(user_id, required_role):
+    return ROLE_RANK.get(get_role(user_id), 0) >= ROLE_RANK.get(required_role, 99)
+
+def compute_level(xp):
+    return max(1, (max(xp, 0) // LEVEL_XP_STEP) + 1)
+
+def update_streak(user_id):
+    """Daily streak: increments if last active was yesterday, resets if gap >1 day, no-op if already today."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    row = get_user_row(user_id)
+    if not row:
+        return 0
+    last = row["last_active_date"] or ""
+    streak = row["streak_count"] or 0
+    if last == today:
+        return streak
+    elif last == yesterday:
+        streak += 1
+    else:
+        streak = 1
+    with _db_lock:
+        conn = get_db()
+        conn.execute("UPDATE users SET streak_count=?, last_active_date=? WHERE user_id=?", (streak, today, user_id))
+        conn.commit()
+        conn.close()
+    return streak
+
+def add_xp(user_id, delta, username=""):
+    ensure_user(user_id, username)
+    with _db_lock:
+        conn = get_db()
+        row = conn.execute("SELECT xp FROM users WHERE user_id=?", (user_id,)).fetchone()
+        new_xp = max(0, (row["xp"] if row else 0) + delta)
+        new_level = compute_level(new_xp)
+        conn.execute("UPDATE users SET xp=?, level=? WHERE user_id=?", (new_xp, new_level, user_id))
+        conn.commit()
+        conn.close()
+    return new_xp, new_level
+
+def award_badge(user_id, badge_name):
+    with _db_lock:
+        conn = get_db()
+        try:
+            conn.execute(
+                "INSERT INTO badges (user_id, badge_name, earned_at) VALUES (?,?,?)",
+                (user_id, badge_name, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            )
+            conn.commit()
+            newly_awarded = True
+        except sqlite3.IntegrityError:
+            newly_awarded = False
+        conn.close()
+    if newly_awarded:
+        send_message(user_id, f"🏅 *New Badge Unlocked!*\n\n`{badge_name}`\nKeep it up!")
+    return newly_awarded
+
+def check_and_award_badges(user_id):
+    row = get_user_row(user_id)
+    if not row:
+        return
+    xp, streak = row["xp"], row["streak_count"]
+    conn = get_db()
+    quiz_count = conn.execute("SELECT COUNT(*) c FROM quiz_history WHERE user_id=?", (user_id,)).fetchone()["c"]
+    conn.close()
+    if streak >= 7:
+        award_badge(user_id, "7-Day Streak 🔥")
+    if streak >= 3:
+        award_badge(user_id, "3-Day Streak ⚡")
+    if xp >= 500:
+        award_badge(user_id, "Quiz Master 🏆")
+    if quiz_count >= 10:
+        award_badge(user_id, "Consistent Learner 📚")
+
+def log_quiz_attempt(user_id, subject, chapter, correct_count, wrong_count, time_taken):
+    score = correct_count - wrong_count
+    with _db_lock:
+        conn = get_db()
+        conn.execute(
+            "INSERT INTO quiz_history (user_id, subject, chapter, score, correct_count, wrong_count, time_taken, timestamp) VALUES (?,?,?,?,?,?,?,?)",
+            (user_id, subject, chapter or "Full Syllabus", score, correct_count, wrong_count, time_taken, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        )
+        conn.commit()
+        conn.close()
+
+def get_leaderboard(period="alltime", limit=10):
+    conn = get_db()
+    if period == "alltime":
+        rows = conn.execute("SELECT user_id, username, xp, level FROM users ORDER BY xp DESC LIMIT ?", (limit,)).fetchall()
+    else:
+        days = {"daily": 1, "weekly": 7, "monthly": 30}.get(period, 7)
+        since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        rows = conn.execute(
+            """SELECT u.user_id, u.username, SUM(q.score) as periodic_score
+               FROM quiz_history q JOIN users u ON u.user_id = q.user_id
+               WHERE q.timestamp >= ? GROUP BY q.user_id ORDER BY periodic_score DESC LIMIT ?""",
+            (since, limit)
+        ).fetchall()
+    conn.close()
+    return rows
+
+def process_referral(new_user_id, referral_code):
+    conn = get_db()
+    referrer = conn.execute("SELECT user_id FROM users WHERE referral_code=?", (referral_code,)).fetchone()
+    conn.close()
+    if not referrer or referrer["user_id"] == new_user_id:
+        return
+    row = get_user_row(new_user_id)
+    if row and row["referred_by"]:
+        return  # already processed
+    with _db_lock:
+        conn = get_db()
+        conn.execute("UPDATE users SET referred_by=? WHERE user_id=?", (referrer["user_id"], new_user_id))
+        conn.commit()
+        conn.close()
+    add_xp(referrer["user_id"], XP_REFERRAL_BONUS)
+    log_audit(new_user_id, referrer["user_id"], "referral_bonus", f"+{XP_REFERRAL_BONUS} XP for referring {new_user_id}")
+    send_message(referrer["user_id"], f"🎉 *Referral Shield Activated!*\n\nSomeone joined using your referral link. `+{XP_REFERRAL_BONUS} XP` credited.")
+
+# --- ANTI-ABUSE / SECURITY HELPERS ---
+
+def restrict_user(chat_id, user_id, seconds=None):
+    payload = {
+        "chat_id": chat_id,
+        "user_id": user_id,
+        "permissions": {"can_send_messages": False}
+    }
+    if seconds:
+        payload["until_date"] = int(time.time()) + seconds
+    try:
+        requests.post(f"{BASE_URL}/restrictChatMember", json=payload, timeout=5)
+    except Exception:
+        pass
+
+def unrestrict_user(chat_id, user_id):
+    payload = {
+        "chat_id": chat_id,
+        "user_id": user_id,
+        "permissions": {
+            "can_send_messages": True, "can_send_audios": True, "can_send_documents": True,
+            "can_send_photos": True, "can_send_videos": True, "can_send_video_notes": True,
+            "can_send_voice_notes": True, "can_send_polls": True, "can_send_other_messages": True,
+            "can_add_web_page_previews": True
+        }
+    }
+    try:
+        requests.post(f"{BASE_URL}/restrictChatMember", json=payload, timeout=5)
+    except Exception:
+        pass
+
+def ban_user(chat_id, user_id):
+    try:
+        requests.post(f"{BASE_URL}/banChatMember", json={"chat_id": chat_id, "user_id": user_id}, timeout=5)
+    except Exception:
+        pass
+
+def contains_banned_word(text):
+    if not text or not BANNED_WORDS:
+        return False
+    lowered = text.lower()
+    return any(w in lowered for w in BANNED_WORDS)
+
+def handle_abuse_violation(chat_id, user_id, username, message_text):
+    """Instant temp mute + DM to Bot Owner with Unmute/Mute24h/Block inline options."""
+    restrict_user(chat_id, user_id, seconds=600)  # 10-min instant temp mute pending owner review
+    log_audit(0, user_id, "auto_mute", "banned word detected")
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": "✅ Unmute", "callback_data": f"abuse_unmute_{chat_id}_{user_id}"},
+                {"text": "🔇 Mute 24h", "callback_data": f"abuse_mute24_{chat_id}_{user_id}"},
+                {"text": "⛔ Block", "callback_data": f"abuse_block_{chat_id}_{user_id}"}
+            ]
+        ]
+    }
+    send_message(
+        OWNER_ID,
+        f"🛡️ *Anti-Abuse Alert*\n────────────────────────\n👤 User: `{user_id}` ({username})\n📍 Group: `{chat_id}`\n"
+        f"💬 Flagged Message: _{message_text[:200]}_\n\nUser has been auto-muted for 10 minutes pending your decision.",
+        reply_markup=keyboard
+    )
+
+def is_force_sub_member(user_id):
+    if not FORCE_SUB_CHANNEL:
+        return True
+    try:
+        res = requests.get(f"{BASE_URL}/getChatMember", params={"chat_id": FORCE_SUB_CHANNEL, "user_id": user_id}, timeout=5)
+        data = res.json()
+        if data.get("ok"):
+            return data["result"]["status"] in ["creator", "administrator", "member"]
+    except Exception:
+        return True  # fail-open so bot doesn't lock everyone out on API hiccups
+    return True
+
+def prompt_force_subscribe(chat_id, user_id):
+    keyboard = {"inline_keyboard": [[{"text": "📢 Join Channel", "url": FORCE_SUB_CHANNEL_LINK or f"https://t.me/{FORCE_SUB_CHANNEL.lstrip('@')}"}],
+                                     [{"text": "✅ I've Joined", "callback_data": "fsub_recheck"}]]}
+    send_message(chat_id, "🔒 *Access Restricted*\n\nPlease join our official announcement channel to continue using the bot.", reply_markup=keyboard)
+
+def set_focus_mode(chat_id, enable):
+    """Mutes/unmutes the whole group's default permission during a live quiz to stop spam."""
+    permissions = {"can_send_messages": not enable}
+    try:
+        requests.post(f"{BASE_URL}/setChatPermissions", json={"chat_id": chat_id, "permissions": permissions}, timeout=5)
+    except Exception:
+        pass
 
 # --- REST AI CALLS (5 LAYERS) ---
 
@@ -320,6 +669,7 @@ def run_quiz_session(target_chat_id, subject, chapter, count, timer, break_freq=
 
     active_quiz_sessions[target_chat_id] = True
     quiz_report_tracker[target_chat_id] = []
+    set_focus_mode(target_chat_id, enable=True)  # Focus Mode: mute group chatter during the quiz
 
     chap_display = chapter if chapter else "Full Syllabus"
     subtopic_display = f"\nSub-topics: `{subtopics}`" if subtopics else ""
@@ -395,6 +745,7 @@ def run_quiz_session(target_chat_id, subject, chapter, count, timer, break_freq=
         time.sleep(2)
 
     active_quiz_sessions[target_chat_id] = False
+    set_focus_mode(target_chat_id, enable=False)  # Focus Mode: restore normal chat after quiz ends
     send_message(target_chat_id, f"🎉 *QUIZ COMPLETE*\n\n📘 Subject: `{subject}`\n🔢 Total Questions: `{count}`")
 
     if conductor_user_id:
@@ -515,6 +866,15 @@ def get_help_text():
         "      🔁 Recurring daily preset/custom slots\n"
         "▸ `/myschedules` — View your upcoming scheduled quizzes\n"
         "▸ `/reminder` — Set the daily \"Today's Quiz\" announcement time\n\n"
+        "🎮 *Gamification*\n"
+        "▸ `/profile` — XP, Level, Streak & Badges\n"
+        "▸ `/leaderboard [daily|weekly|monthly|alltime]` — Top rankers\n"
+        "▸ `/refer` — Get your referral link (+20 XP per join)\n\n"
+        "📄 *Study Vault*\n"
+        "▸ `/addpdf` — Reply to a PDF to index it into the Study Vault channel\n\n"
+        "🛡️ *Admin/Owner Only*\n"
+        "▸ `/setrole <user_id> <student|moderator|admin|owner>`\n"
+        "▸ `/audit` — View recent moderation/audit logs\n\n"
         "📊 *After every quiz:* a full performance report is DM'd to whoever started it."
     )
 
@@ -598,23 +958,152 @@ def handle_updates():
                             correct_idx = info["correct"]
                             info["total_votes"] += 1
 
+                            username = user.get("username") or user.get("first_name", "")
+                            ensure_user(user_id, username)
+                            streak = update_streak(user_id)
+
                             if correct_idx not in chosen_options:
                                 info["wrong_count"] += 1
+                                add_xp(user_id, XP_WRONG, username)
+                                log_quiz_attempt(user_id, "N/A", "N/A", 0, 1, 0)
                                 wrong_dm_text = (
-                                    f"Your answer was incorrect.\n\n"
+                                    f"Your answer was incorrect. `{XP_WRONG} XP`\n\n"
                                     f"_{info['question']}_\n\n"
                                     f"Correct Option: `{info['options'][correct_idx]}`\n"
                                     f"Explanation: _{info.get('explanation', 'ICAI module principle applies.')}_"
                                 )
                                 send_message(user_id, wrong_dm_text)
+                            else:
+                                add_xp(user_id, XP_CORRECT, username)
+                                log_quiz_attempt(user_id, "N/A", "N/A", 1, 0, 0)
+
+                            check_and_award_badges(user_id)
 
                     if "message" in result:
                         message = result["message"]
                         chat_id = message["chat"]["id"]
                         user_id = message.get("from", {}).get("id", 0)
+                        username = message.get("from", {}).get("username") or message.get("from", {}).get("first_name", "")
                         text = message.get("text", "").strip()
 
+                        if user_id:
+                            ensure_user(user_id, username)
+
+                        # --- FORCE SUBSCRIBE GATE (skips owner/admins and non-command chatter checks) ---
+                        if FORCE_SUB_CHANNEL and user_id and user_id != OWNER_ID and not is_force_sub_member(user_id):
+                            prompt_force_subscribe(chat_id, user_id)
+                            continue
+
+                        # --- ANTI-ABUSE KEYWORD SCAN (group messages only, skip admins/owner) ---
+                        if is_group_chat(chat_id) and text and not text.startswith("/") and contains_banned_word(text):
+                            if not is_user_admin_owner_or_anonymous(message):
+                                handle_abuse_violation(chat_id, user_id, username, text)
+                                continue
+
+                        # --- PDF VAULT: reply to a document with /addpdf ---
+                        if text.startswith("/addpdf"):
+                            replied = message.get("reply_to_message", {})
+                            doc = replied.get("document")
+                            if not doc:
+                                send_message(chat_id, "⚠️ Reply to a PDF/document message with `/addpdf` to index it.")
+                                continue
+                            if not PDF_VAULT_CHANNEL_ID:
+                                send_message(chat_id, "⚠️ PDF Vault channel is not configured by the Owner yet.")
+                                continue
+                            fwd_res = {}
+                            try:
+                                fwd_res = requests.post(f"{BASE_URL}/forwardMessage", json={
+                                    "chat_id": PDF_VAULT_CHANNEL_ID, "from_chat_id": chat_id, "message_id": replied["message_id"]
+                                }, timeout=5).json()
+                            except Exception:
+                                pass
+                            channel_msg_id = fwd_res.get("result", {}).get("message_id") if fwd_res.get("ok") else None
+                            with _db_lock:
+                                conn = get_db()
+                                conn.execute(
+                                    "INSERT INTO pdf_index (file_id, file_name, uploaded_by, timestamp, channel_message_id) VALUES (?,?,?,?,?)",
+                                    (doc.get("file_id"), doc.get("file_name", "unnamed.pdf"), user_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), channel_msg_id)
+                                )
+                                conn.commit()
+                                conn.close()
+                            log_audit(user_id, user_id, "pdf_upload", doc.get("file_name", "unnamed.pdf"))
+                            send_message(chat_id, f"📄 *PDF Indexed to Study Vault*\n\nFile: `{doc.get('file_name', 'unnamed.pdf')}`")
+                            continue
+
+                        # --- PROFILE / LEADERBOARD / REFERRAL / ROLE / AUDIT COMMANDS ---
+                        if text.startswith("/profile"):
+                            row = get_user_row(user_id)
+                            conn = get_db()
+                            b_rows = conn.execute("SELECT badge_name FROM badges WHERE user_id=?", (user_id,)).fetchall()
+                            conn.close()
+                            badges_text = ", ".join([b["badge_name"] for b in b_rows]) or "None yet"
+                            send_message(chat_id,
+                                f"👤 *YOUR PROFILE*\n────────────────────────\n"
+                                f"🏷 Role: `{get_role(user_id).title()}`\n"
+                                f"✨ XP: `{row['xp']}`  |  📈 Level: `{row['level']}`\n"
+                                f"🔥 Streak: `{row['streak_count']} day(s)`\n"
+                                f"🏅 Badges: {badges_text}\n"
+                                f"🔗 Referral Code: `{row['referral_code']}`"
+                            )
+                            continue
+
+                        elif text.startswith("/leaderboard"):
+                            parts = text.split()
+                            period = parts[1].lower() if len(parts) > 1 and parts[1].lower() in ["daily", "weekly", "monthly", "alltime"] else "alltime"
+                            rows = get_leaderboard(period)
+                            if not rows:
+                                send_message(chat_id, "No leaderboard data yet. Play a quiz to get ranked!")
+                                continue
+                            lines = [f"🏆 *LEADERBOARD ({period.upper()})*", "────────────────────────"]
+                            for i, r in enumerate(rows, 1):
+                                score_val = r["xp"] if period == "alltime" else r["periodic_score"]
+                                uname = r["username"] or str(r["user_id"])
+                                lines.append(f"{i}. {uname} — `{score_val}` pts")
+                            send_message(chat_id, "\n".join(lines))
+                            continue
+
+                        elif text.startswith("/refer"):
+                            row = get_user_row(user_id)
+                            bot_username = os.getenv("BOT_USERNAME", "")
+                            link = f"https://t.me/{bot_username}?start=ref_{row['referral_code']}" if bot_username else f"Referral Code: `{row['referral_code']}`"
+                            send_message(chat_id, f"🎁 *Your Referral Shield*\n\nInvite friends using this link — you earn `+{XP_REFERRAL_BONUS} XP` per join:\n{link}")
+                            continue
+
+                        elif text.startswith("/setrole"):
+                            if not role_at_least(user_id, "admin"):
+                                send_message(chat_id, "Permission denied. Admins/Owner only.")
+                                continue
+                            parts = text.replace("/setrole", "").strip().split()
+                            if len(parts) != 2 or not parts[0].lstrip("-").isdigit() or parts[1].lower() not in ["student", "moderator", "admin", "owner"]:
+                                send_message(chat_id, "Usage: `/setrole <user_id> <student|moderator|admin|owner>`")
+                                continue
+                            if parts[1].lower() == "owner" and user_id != OWNER_ID:
+                                send_message(chat_id, "Only the Owner can grant the Owner role.")
+                                continue
+                            set_role(int(parts[0]), parts[1].lower(), user_id)
+                            send_message(chat_id, f"✅ Role for `{parts[0]}` set to `{parts[1].lower()}`.")
+                            continue
+
+                        elif text.startswith("/audit"):
+                            if not role_at_least(user_id, "admin"):
+                                send_message(chat_id, "Permission denied. Admins/Owner only.")
+                                continue
+                            conn = get_db()
+                            rows = conn.execute("SELECT * FROM audit_logs ORDER BY log_id DESC LIMIT 15").fetchall()
+                            conn.close()
+                            if not rows:
+                                send_message(chat_id, "No audit log entries yet.")
+                                continue
+                            lines = ["📜 *RECENT AUDIT LOG*", "────────────────────────"]
+                            for r in rows:
+                                lines.append(f"`{r['timestamp']}` — {r['action_type']} — target:`{r['target_user_id']}` by:`{r['admin_id']}`\n_{r['reason']}_")
+                            send_message(chat_id, "\n".join(lines))
+                            continue
+
                         if text.startswith("/start"):
+                            payload = text.replace("/start", "").strip()
+                            if payload.startswith("ref_"):
+                                process_referral(user_id, payload.replace("ref_", "").strip())
                             welcome_msg = (
                                 "🦅 *Welcome to CA Vault Quiz Engine*\n\n"
                                 "⚡ High-yield, AI-generated practice quizzes for CA Foundation.\n\n"
@@ -943,6 +1432,33 @@ def handle_updates():
 
                         if data_cb == "show_help_menu":
                             edit_message(query_chat_id, message_id, get_help_text())
+
+                        elif data_cb == "fsub_recheck":
+                            if is_force_sub_member(cb_user_id):
+                                edit_message(query_chat_id, message_id, "✅ Verified! You now have full access. Send /start to open the menu.")
+                            else:
+                                send_message(query_chat_id, "⚠️ Still not detected as a member. Please join the channel first.")
+
+                        elif data_cb.startswith("abuse_"):
+                            if cb_user_id != OWNER_ID:
+                                continue
+                            try:
+                                _, action, grp_id_str, target_id_str = data_cb.split("_", 3)
+                            except ValueError:
+                                continue
+                            grp_id, target_id = int(grp_id_str), int(target_id_str)
+                            if action == "unmute":
+                                unrestrict_user(grp_id, target_id)
+                                log_audit(OWNER_ID, target_id, "unmute", "owner approved unmute")
+                                edit_message(query_chat_id, message_id, f"✅ User `{target_id}` unmuted in group `{grp_id}`.")
+                            elif action == "mute24":
+                                restrict_user(grp_id, target_id, seconds=MUTE_24H_SECONDS)
+                                log_audit(OWNER_ID, target_id, "mute_24h", "owner approved 24h mute")
+                                edit_message(query_chat_id, message_id, f"🔇 User `{target_id}` muted for 24h in group `{grp_id}`.")
+                            elif action == "block":
+                                ban_user(grp_id, target_id)
+                                log_audit(OWNER_ID, target_id, "block", "owner approved permanent block")
+                                edit_message(query_chat_id, message_id, f"⛔ User `{target_id}` blocked from group `{grp_id}`.")
 
                         elif data_cb == "rem_custom_prompt":
                             edit_message(query_chat_id, message_id, "Send the exact reminder time as a command:\n`/setreminder_custom 08:30 AM`")
@@ -1331,6 +1847,9 @@ def finalize_schedule_wizard(chat_id, user_id, tmr, message_id=None):
 
 
 if __name__ == "__main__":
+    # Initialize the production database (users, quiz_history, badges, pdf_index, leaderboard_cache, audit_logs)
+    init_db()
+
     # Load any previously saved links / schedules
     load_persisted_data()
 
