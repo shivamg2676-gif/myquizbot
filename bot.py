@@ -53,6 +53,14 @@ SHAYARI_LIST = [
     "🏛️ *Raaton ka jaagna rang layega zaroor,\nPrefix mein CA lagna ab zyada nahi hai door!*"
 ]
 
+# --- AESTHETIC THEME HELPERS (colorful, modern, consistent look across the whole bot) ---
+DIVIDER = "🌈 ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬ 🌈"
+SOFT_DIVIDER = "· · ─ ·𖥸· ─ · ·"
+SPARKLE_ROW = "✨ 💎 🔥 ⚡ 🏆 ⚡ 🔥 💎 ✨"
+
+def fancy_header(emoji, title):
+    return f"{emoji} ░▒▓ **{title}** ▓▒░ {emoji}"
+
 print("🦅 CA Vault Ultra-Aesthetic Master OS Starting (Full Enterprise Version)...")
 
 # --- TELEGRAM API HELPER FUNCTIONS ---
@@ -172,6 +180,26 @@ def is_user_admin_or_owner(message):
             return False
     return False
 
+# --- PERSISTENT GROUP-LINK RESOLVER ---
+# Once a user links a group (via /link_group, or automatically by running
+# /quiz or /schedule directly inside a group), that group is remembered in the
+# database FOREVER for that user. Every quiz / schedule / instant-session flow
+# in this file resolves the target group through this single helper so the
+# person never has to re-link, no matter which feature they use.
+
+def resolve_target_group(user_id, current_chat_id=None, auto_save_if_group=True):
+    linked = database.get_user_linked_group(user_id)
+    if linked:
+        return linked
+    if current_chat_id and is_group_chat(current_chat_id):
+        if auto_save_if_group:
+            try:
+                database.set_user_linked_group(user_id, current_chat_id)
+            except Exception:
+                pass
+        return current_chat_id
+    return None
+
 # --- SMART CONTEXT DETECTOR FOR KNOWLEDGE HUB ---
 
 def detect_material_request_intent(text):
@@ -181,18 +209,18 @@ def detect_material_request_intent(text):
         kw = kw_entry["keyword"].lower()
         if kw in text_lower:
             return kw_entry
-            
+
     demand_triggers = ["chahiye", "bhej do", "send notes", "pdf link", "notes please", "give notes", "share pdf"]
     casual_triggers = ["tough hain", "kya tumne", "kaun padh raha hai", "samajh nahi aaya"]
-    
+
     if any(c in text_lower for c in casual_triggers):
         return None
-        
+
     if any(d in text_lower for d in demand_triggers):
         for kw_entry in keywords:
-            if kw_entry["teacher_name"].lower() in text_lower or kw_entry["keyword"].replace("#","").replace("_"," ") in text_lower:
+            if kw_entry["teacher_name"].lower() in text_lower or kw_entry["keyword"].replace("#", "").replace("_", " ") in text_lower:
                 return kw_entry
-                
+
     return None
 
 # --- REST AI CALLS ---
@@ -393,7 +421,7 @@ def parse_raw_text_questions(raw_text):
             questions.append({"question": q_text, "options": opts[:4], "correct": max(0, min(corr, 3)), "explanation": expl, "type": "theory"})
     return questions
 
-def send_poll(chat_id, question, options, correct_option_id, open_period=30):
+def send_poll(chat_id, question, options, correct_option_id, open_period=30, subject=""):
     payload = {
         "chat_id": chat_id,
         "question": question[:300],
@@ -415,7 +443,7 @@ def send_poll(chat_id, question, options, correct_option_id, open_period=30):
                 "question": question,
                 "wrong_count": 0,
                 "total_votes": 0,
-                "subject": ""
+                "subject": subject or ""
             }
         return data
     except Exception:
@@ -436,7 +464,7 @@ def run_quiz_session(target_chat_id, subject, chapter, count, timer, break_freq=
     active_quiz_session_timers[target_chat_id] = timer
     session_user_scores[target_chat_id] = {}
     session_user_streaks[target_chat_id] = {}
-    
+
     if is_group_chat(target_chat_id):
         set_chat_permissions(target_chat_id, can_send_messages=False)
         database.log_audit(0, 0, "FOCUS_MODE_ON", f"Auto-enabled focus mode for quiz in {target_chat_id}")
@@ -444,19 +472,19 @@ def run_quiz_session(target_chat_id, subject, chapter, count, timer, break_freq=
     chap_display = chapter if chapter else "Full Syllabus"
     subtopic_display = f"\n🎯 *Sub-topics:* `{subtopics}`" if subtopics else ""
     break_info = f"☕ *Break:* Every `{break_freq}` Qs ({break_duration//60} mins)" if break_freq > 0 else "⚡ *Mode:* Non-stop Sprint"
-    
+
     start_box = (
-        f"⚡ ░▒▓ **LIVE QUIZ ARENA IS ACTIVE!** ▓▒░ ⚡\n"
-        f"✨ ══════════════════════════ ✨\n"
+        f"{fancy_header('⚡', 'LIVE QUIZ ARENA IS ACTIVE!')}\n"
+        f"{DIVIDER}\n"
         f"📘 **Subject:** `{subject}`\n"
         f"📖 **Chapter:** `{chap_display}`{subtopic_display}\n"
         f"🔢 **Questions:** `{count}` ｜ ⏱️ **Timer:** `{timer}s`\n"
         f"{break_info}\n"
-        f"✨ ══════════════════════════ ✨\n\n"
+        f"{DIVIDER}\n\n"
         f"🚀 *Lock in champs! First question dropping right now...*"
     )
     send_message(target_chat_id, start_box)
-    
+
     current_difficulty = level
     total_session_votes = 0
     total_session_wrongs = 0
@@ -483,21 +511,21 @@ def run_quiz_session(target_chat_id, subject, chapter, count, timer, break_freq=
         q = generate_ai_question(subject, chapter, current_difficulty)
         current_live_timer = active_quiz_session_timers.get(target_chat_id, timer)
         poll_timer = max(10, min(current_live_timer, 60))
-        
-        poll_res = send_poll(target_chat_id, f"Q{idx+1}/{count}: {q['question']}", q['options'], q['correct'], open_period=poll_timer)
+
+        poll_res = send_poll(target_chat_id, f"Q{idx+1}/{count}: {q['question']}", q['options'], q['correct'], open_period=poll_timer, subject=subject)
         poll_id = poll_res.get("result", {}).get("poll", {}).get("id") if poll_res.get("ok") else None
-        
+
         time.sleep(poll_timer + 1)
-        
+
         if poll_id and poll_id in active_poll_tracker:
             p_data = active_poll_tracker[poll_id]
             total_v = p_data["total_votes"]
             wrong_v = p_data["wrong_count"]
-            
+
             questions_attempted += 1
             total_session_votes += total_v
             total_session_wrongs += wrong_v
-            
+
             wrong_percentage = (wrong_v / total_v * 100) if total_v > 0 else 0
             if total_v > 0 and wrong_percentage > 60:
                 current_difficulty = "MEDIUM"
@@ -508,16 +536,16 @@ def run_quiz_session(target_chat_id, subject, chapter, count, timer, break_freq=
 
         feedback_text = (
             f"💡 **Q{idx+1} OFFICIAL EXPLANATION CARD**\n"
-            f"✨ ══════════════════════════ ✨\n"
+            f"{SOFT_DIVIDER}\n"
             f"✅ **Correct Choice:** `{q['options'][q['correct']]}`\n\n"
             f"🔍 **ICAI Concept Logic:**\n_{q['explanation']}_\n"
-            f"✨ ══════════════════════════ ✨"
+            f"{SOFT_DIVIDER}"
         )
         send_message(target_chat_id, feedback_text)
         time.sleep(2)
 
     active_quiz_sessions[target_chat_id] = False
-    
+
     if is_group_chat(target_chat_id):
         set_chat_permissions(target_chat_id, can_send_messages=True)
         database.log_audit(0, 0, "FOCUS_MODE_OFF", f"Disabled focus mode after quiz in {target_chat_id}")
@@ -533,7 +561,7 @@ def run_quiz_session(target_chat_id, subject, chapter, count, timer, break_freq=
         f"🔢 **Questions Delivered:** `{questions_attempted}/{count}`\n"
         f"📥 **Total Votes:** `{total_session_votes}`\n"
         f"🎯 **Group Accuracy Rate:** `{overall_correct_pct:.1f}%`\n"
-        f"✨ ══════════════════════════ ✨"
+        f"{DIVIDER}"
     )
 
     send_message(target_chat_id, f"🎉 **QUIZ COMPLETE!**\n\n{summary_report}")
@@ -544,16 +572,17 @@ def run_quiz_session(target_chat_id, subject, chapter, count, timer, break_freq=
     if scores:
         sorted_scores = sorted(scores.items(), key=lambda item: (item[1]["xp"], item[1]["correct"]), reverse=True)
         medals = ["👑 GOLD CHAMPION", "🥈 SILVER STAR", "🥉 BRONZE PERFORMER"]
-        
+
         shayari = random.choice(SHAYARI_LIST)
-        top_msg = f"{shayari}\n\n🏆 **HALL OF FAME — TOP PERFORMERS** 🏆\n📘 `{subject}` ｜ 🔢 `{count} Questions`\n\n"
-        
+        top_msg = f"{SPARKLE_ROW}\n{shayari}\n\n🏆 **HALL OF FAME — TOP PERFORMERS** 🏆\n📘 `{subject}` ｜ 🔢 `{count} Questions`\n\n"
+
         for idx, (uid, uinfo) in enumerate(sorted_scores[:3]):
             top_msg += f"{medals[idx]} ✨\n👤 **{uinfo['name']}**: `{uinfo['xp']} XP` ｜ ✅ `{uinfo['correct']}` Correct\n\n"
             if idx == 0 and "SUNDAY MEGA" in subject.upper():
                 database.set_flex_admin(uid)
                 send_message(target_chat_id, f"🏆 **SUNDAY MEGA QUIZ CHAMPION!**\n\nCongratulations <a href='tg://user?id={uid}'>{uinfo['name']}</a>! You unlocked **Sunday Flex Admin 🎖️** for 1 week!", parse_mode="HTML")
-        
+
+        top_msg += SPARKLE_ROW
         res_top = send_message(target_chat_id, top_msg)
         if res_top.get("ok"):
             msg_id = res_top["result"]["message_id"]
@@ -608,10 +637,10 @@ def scheduler_background_worker():
             if time_hm == "06:00" and not pinned_daily_messages.get(today_str, False):
                 pinned_daily_messages[today_str] = True
                 sched = database.get_or_create_daily_schedule(today_str)
-                
+
                 target_chat = MAIN_GROUP_ID if MAIN_GROUP_ID != 0 else OWNER_ID
                 schedule_pin_text = (
-                    f"📌 ░▒▓ **DAILY TARGET & QUIZ PLAN** ▓▒░ 📌\n\n"
+                    f"{fancy_header('📌', 'DAILY TARGET & QUIZ PLAN')}\n\n"
                     f"📅 **Date:** `{today_str}`\n"
                     f"📚 **Subject Focus:** `{sched['subject']}`\n"
                     f"📖 **Module Scope:** `{sched['chapter_name']}`\n"
@@ -637,13 +666,13 @@ def scheduler_background_worker():
                     threading.Thread(
                         target=run_quiz_session,
                         args=(
-                            job["chat_id"], 
-                            job["subject"], 
-                            job["chapter"], 
-                            job["count"], 
-                            job["timer"], 
-                            job.get("break_freq", 0), 
-                            job.get("break_duration", 0), 
+                            job["chat_id"],
+                            job["subject"],
+                            job["chapter"],
+                            job["count"],
+                            job["timer"],
+                            job.get("break_freq", 0),
+                            job.get("break_duration", 0),
                             job.get("level", "EXTREME_HIGH"),
                             job.get("conductor_id"),
                             job.get("subtopics", "")
@@ -681,10 +710,10 @@ def get_wizard_summary(st):
     sch_time = st.get("schedule_time", "Not Selected")
     cnt = st.get("count", "Not Selected")
     tmr = st.get("timer", "Not Selected")
-    
+
     return (
         f"📊 **CURRENT SESSION SCOPE SUMMARY**\n"
-        f"✨ ══════════════════════════ ✨\n"
+        f"{DIVIDER}\n"
         f"📌 **Group:** `{grp}`\n"
         f"📘 **Subject:** `{subj}`\n"
         f"📖 **Chapter:** `{chap or 'Full Subject Syllabus'}`\n"
@@ -692,7 +721,7 @@ def get_wizard_summary(st):
         f"🔥 **Difficulty:** `{lvl}`\n"
         f"📅 **Date:** `{sch_date}` ｜ ⏰ **Time:** `{sch_time}`\n"
         f"🔢 **Questions:** `{cnt}` ｜ ⏱️ **Timer:** `{tmr}`\n"
-        f"✨ ══════════════════════════ ✨\n\n"
+        f"{DIVIDER}\n\n"
     )
 
 def get_role_based_help_text(user_id):
@@ -706,9 +735,10 @@ def get_role_based_help_text(user_id):
             "• `/settime [HH:MM]` : Set Daily Quiz Window\n"
             "• `/settimer [seconds]` : Dynamic Live Timer Override\n\n"
             "💬 **2. DM CONTROL WIZARD & SCHEDULER**\n"
-            "• `/link_group <GroupID>` : Connect Target Group\n"
+            "• `/link_group <GroupID>` : Connect Target Group (one-time — remembered forever)\n"
             "• `/schedule` : Interactive Step-by-Step Wizard\n"
-            "• `/setschedule YYYY-MM-DD | HH:MM AM/PM` : Precision Lock\n\n"
+            "• `/setschedule YYYY-MM-DD | HH:MM AM/PM` : Precision Lock\n"
+            "• `/chapter_only_sched [Chapter]` / `/chapter_sched [Chapter] | [Sub-topics]` : Wizard chapter step\n\n"
             "📚 **3. SMART KNOWLEDGE HUB & KEYWORDS**\n"
             "• `/addkeyword [#kw] | [link] | [teacher]` : Add Keyword\n"
             "• `/keywords` : Index All Study Keywords & Vault Links\n"
@@ -720,7 +750,10 @@ def get_role_based_help_text(user_id):
             "• `/stickers [on|off]` : Auto-Sticker Purge\n\n"
             "👥 **5. QUIZ ACCESS & TRIAL GRANTS**\n"
             "• `/grant [user_id] [1week|2weeks|fullfree]` : Grant Access\n"
-            "• `/revoke [user_id]` : Revoke Access"
+            "• `/revoke [user_id]` : Revoke Access\n\n"
+            "🎯 **6. LIVE QUIZ**\n"
+            "• `/quiz` : Instant Quiz Wizard (works in DM or directly in the linked group)\n"
+            "• `/chapter_only [Chapter]` / `/chapter [Chapter] | [Sub-topics]` : Instant-quiz chapter step"
         )
     else:
         return (
@@ -736,16 +769,17 @@ def get_role_based_help_text(user_id):
 # --- UI DASHBOARD BUILDER ---
 
 def build_main_home_ui(first_name, linked_group_id=None):
-    grp_status = f"`{linked_group_id}` ⚡" if linked_group_id else "❌ *Not Connected*"
+    grp_status = f"`{linked_group_id}` ⚡ *(saved — no need to re-link)*" if linked_group_id else "❌ *Not Connected*"
     text = (
+        f"{SPARKLE_ROW}\n"
         f"⚡ ░▒▓ **CA VAULT SYSTEM OS** ▓▒░ ⚡\n"
-        f"✨ ══════════════════════════ ✨\n"
+        f"{DIVIDER}\n"
         f"👋 **Welcome Back, {first_name}!**\n"
         f"🤖 *AI-Powered CA Foundation Practice Engine*\n\n"
         f"🔗 **Linked Target Group:** {grp_status}\n"
-        f"⚡ **Status:** Active & Operational\n"
-        f"✨ ══════════════════════════ ✨\n"
-        f"👇 *Select an operational card below to launch:* "
+        f"⚡ **Status:** 🟢 Active & Operational\n"
+        f"{DIVIDER}\n"
+        f"👇 *Select an operational card below to launch:*"
     )
     kb = {
         "inline_keyboard": [
@@ -759,7 +793,7 @@ def build_main_home_ui(first_name, linked_group_id=None):
 def handle_updates():
     offset = 0
     print("🤖 Telegram Bot Polling Engine Online...")
-    
+
     while True:
         try:
             if not BASE_URL:
@@ -769,11 +803,11 @@ def handle_updates():
 
             response = requests.get(f"{BASE_URL}/getUpdates", params={"offset": offset, "timeout": 10}, timeout=12)
             data = response.json()
-            
+
             if data.get("ok"):
                 for result in data.get("result", []):
                     offset = result["update_id"] + 1
-                    
+
                     # --- POLL ANSWER HANDLER ---
                     if "poll_answer" in result:
                         p_ans = result["poll_answer"]
@@ -783,35 +817,35 @@ def handle_updates():
                         first_name = user.get("first_name", "Student")
                         username = user.get("username", "")
                         chosen_options = p_ans.get("option_ids", [])
-                        
+
                         database.get_or_create_user(user_id, username, first_name, owner_id=OWNER_ID)
-                        
+
                         if poll_id in active_poll_tracker and chosen_options:
                             info = active_poll_tracker[poll_id]
                             chat_id = info["chat_id"]
                             correct_idx = info["correct"]
                             info["total_votes"] += 1
-                            
+
                             if chat_id not in session_user_scores:
                                 session_user_scores[chat_id] = {}
                             if chat_id not in session_user_streaks:
                                 session_user_streaks[chat_id] = {}
-                                
+
                             if user_id not in session_user_scores[chat_id]:
                                 session_user_scores[chat_id][user_id] = {"correct": 0, "wrong": 0, "xp": 0, "name": first_name}
                             if user_id not in session_user_streaks[chat_id]:
                                 session_user_streaks[chat_id][user_id] = 0
-                            
+
                             if correct_idx in chosen_options:
                                 database.add_user_xp(user_id, 4)
                                 session_user_scores[chat_id][user_id]["correct"] += 1
                                 session_user_scores[chat_id][user_id]["xp"] += 4
                                 session_user_streaks[chat_id][user_id] += 1
-                                
+
                                 streak = session_user_streaks[chat_id][user_id]
                                 praise = get_streak_praise(streak)
-                                database.record_quiz_history(user_id, chat_id, info.get("subject", "CA"), "", 4, 1, 0)
-                                
+                                database.record_quiz_history(user_id, chat_id, info.get("subject") or "CA", "", 4, 1, 0)
+
                                 praise_dm = f"{praise} **Spot On Jawab!** (+4 XP)\n🔥 Active Streak: `{streak} In A Row`"
                                 send_message(user_id, praise_dm)
                             else:
@@ -820,8 +854,8 @@ def handle_updates():
                                 session_user_scores[chat_id][user_id]["wrong"] += 1
                                 session_user_scores[chat_id][user_id]["xp"] -= 1
                                 session_user_streaks[chat_id][user_id] = 0
-                                database.record_quiz_history(user_id, chat_id, info.get("subject", "CA"), "", -1, 0, 1)
-                                
+                                database.record_quiz_history(user_id, chat_id, info.get("subject") or "CA", "", -1, 0, 1)
+
                                 wrong_dm_text = (
                                     f"❌ **Oof! Incorrect Choice.**\n\n"
                                     f"❓ _{info['question']}_\n\n"
@@ -839,7 +873,7 @@ def handle_updates():
                         first_name = message["from"].get("first_name", "Student")
                         username = message["from"].get("username", "")
                         text = message.get("text", "").strip()
-                        
+
                         if "new_chat_members" in message:
                             for new_mem in message["new_chat_members"]:
                                 quote = random.choice(MOTIVATIONAL_QUOTES)
@@ -851,12 +885,12 @@ def handle_updates():
 
                         u_db = database.get_or_create_user(user_id, username, first_name, owner_id=OWNER_ID)
                         linked_grp = database.get_user_linked_group(user_id)
-                        
+
                         if FORCE_SUB_CHANNEL and not check_force_sub(user_id):
                             restrict_chat_member(chat_id, user_id)
                             gate_kb = {
                                 "inline_keyboard": [
-                                    [{"text": "📢 Join Official Channel", "url": f"[https://t.me/](https://t.me/){FORCE_SUB_CHANNEL.replace('@','')}"}]
+                                    [{"text": "📢 Join Official Channel", "url": f"https://t.me/{FORCE_SUB_CHANNEL.replace('@','')}"}]
                                 ]
                             }
                             send_message(chat_id, f"⚠️ **Access Restricted <a href='tg://user?id={user_id}'>{first_name}</a>!**\n\nPlease join our official channel `{FORCE_SUB_CHANNEL}` to unmute.", reply_markup=gate_kb, parse_mode="HTML")
@@ -866,7 +900,7 @@ def handle_updates():
                             doc = message["document"]
                             file_id = doc["file_id"]
                             file_name = doc.get("file_name", "Study_Material.pdf")
-                            
+
                             if database.is_duplicate_file(file_id):
                                 if not text.startswith("/addpdf"):
                                     send_message(chat_id, f"ℹ️ **File Already Exists:** `{file_name}` is available in Vault!")
@@ -888,7 +922,7 @@ def handle_updates():
                                 restrict_chat_member(chat_id, user_id, until_date=int((datetime.now() + timedelta(hours=24)).timestamp()) if not is_p else None)
                                 send_message(OWNER_ID, f"🛡️ **MODERATION ALERT**: Muted {first_name} (@{username}) for sticker. Strike #{warn_c}.")
                                 continue
-                            
+
                             bad_words = database.get_bad_words()
                             if any(w in text.lower() for w in bad_words if w):
                                 delete_message(chat_id, message_id)
@@ -914,17 +948,17 @@ def handle_updates():
                                     parts = raw_val.split("|")
                                     date_val = parts[0].strip()
                                     time_val = parts[1].strip().upper()
-                                    
+
                                     try:
                                         datetime.strptime(date_val, "%Y-%m-%d")
                                         datetime.strptime(time_val, "%I:%M %p")
-                                        
+
                                         schedule_wizard_state[user_id]["schedule_date"] = date_val
                                         schedule_wizard_state[user_id]["schedule_time"] = time_val
-                                        
+
                                         st = schedule_wizard_state[user_id]
                                         summary = get_wizard_summary(st)
-                                        
+
                                         keyboard = {
                                             "inline_keyboard": [
                                                 [{"text": "10 Qs", "callback_data": "swiz_cnt_10"}, {"text": "20 Qs", "callback_data": "swiz_cnt_20"}],
@@ -937,6 +971,80 @@ def handle_updates():
                                 else:
                                     send_message(chat_id, "⚠️ **Missing separator (`|`)!**\nUse: `/setschedule YYYY-MM-DD | hh:mm AM/PM`")
 
+                        elif text.startswith("/chapter_only_sched"):
+                            if user_id in schedule_wizard_state:
+                                chapter_name = text.replace("/chapter_only_sched", "", 1).strip()
+                                if chapter_name:
+                                    schedule_wizard_state[user_id]["chapter"] = chapter_name
+                                    schedule_wizard_state[user_id]["subtopics"] = ""
+                                    st = schedule_wizard_state[user_id]
+                                    summary = get_wizard_summary(st)
+                                    keyboard = {
+                                        "inline_keyboard": [
+                                            [{"text": "⚡ MEDIUM", "callback_data": "swiz_lvl_MEDIUM"}],
+                                            [{"text": "🔥 HIGH", "callback_data": "swiz_lvl_HIGH"}],
+                                            [{"text": "💀 EXTREME HIGH", "callback_data": "swiz_lvl_EXTREME_HIGH"}]
+                                        ]
+                                    }
+                                    send_message(chat_id, f"{summary}✅ **Chapter Locked:** `{chapter_name}`\n\n🎯 **Step 3:** Select Starting Difficulty Level:", reply_markup=keyboard)
+                                else:
+                                    send_message(chat_id, "⚠️ Usage: `/chapter_only_sched [Chapter Name]`")
+
+                        elif text.startswith("/chapter_sched"):
+                            if user_id in schedule_wizard_state:
+                                raw = text.replace("/chapter_sched", "", 1).strip()
+                                if "|" in raw:
+                                    chap_part, sub_part = raw.split("|", 1)
+                                    schedule_wizard_state[user_id]["chapter"] = chap_part.strip()
+                                    schedule_wizard_state[user_id]["subtopics"] = sub_part.strip()
+                                    st = schedule_wizard_state[user_id]
+                                    summary = get_wizard_summary(st)
+                                    keyboard = {
+                                        "inline_keyboard": [
+                                            [{"text": "⚡ MEDIUM", "callback_data": "swiz_lvl_MEDIUM"}],
+                                            [{"text": "🔥 HIGH", "callback_data": "swiz_lvl_HIGH"}],
+                                            [{"text": "💀 EXTREME HIGH", "callback_data": "swiz_lvl_EXTREME_HIGH"}]
+                                        ]
+                                    }
+                                    send_message(chat_id, f"{summary}✅ **Chapter + Sub-topics Locked!**\n\n🎯 **Step 3:** Select Starting Difficulty Level:", reply_markup=keyboard)
+                                else:
+                                    send_message(chat_id, "⚠️ Usage: `/chapter_sched Chapter Name | Subtopic 1, Subtopic 2`")
+
+                        elif text.startswith("/chapter_only"):
+                            if chat_id in quiz_builder_state:
+                                chapter_name = text.replace("/chapter_only", "", 1).strip()
+                                if chapter_name:
+                                    quiz_builder_state[chat_id]["chapter"] = chapter_name
+                                    quiz_builder_state[chat_id]["subtopics"] = ""
+                                    keyboard = {
+                                        "inline_keyboard": [
+                                            [{"text": "⚡ MEDIUM", "callback_data": "lvl_MEDIUM"}],
+                                            [{"text": "🔥 HIGH", "callback_data": "lvl_HIGH"}],
+                                            [{"text": "💀 EXTREME HIGH", "callback_data": "lvl_EXTREME_HIGH"}]
+                                        ]
+                                    }
+                                    send_message(chat_id, f"✅ **Chapter Locked:** `{chapter_name}`\n\n🎯 **Step 3:** Select Starting Difficulty Level:", reply_markup=keyboard)
+                                else:
+                                    send_message(chat_id, "⚠️ Usage: `/chapter_only [Chapter Name]`")
+
+                        elif text.startswith("/chapter"):
+                            if chat_id in quiz_builder_state:
+                                raw = text.replace("/chapter", "", 1).strip()
+                                if "|" in raw:
+                                    chap_part, sub_part = raw.split("|", 1)
+                                    quiz_builder_state[chat_id]["chapter"] = chap_part.strip()
+                                    quiz_builder_state[chat_id]["subtopics"] = sub_part.strip()
+                                    keyboard = {
+                                        "inline_keyboard": [
+                                            [{"text": "⚡ MEDIUM", "callback_data": "lvl_MEDIUM"}],
+                                            [{"text": "🔥 HIGH", "callback_data": "lvl_HIGH"}],
+                                            [{"text": "💀 EXTREME HIGH", "callback_data": "lvl_EXTREME_HIGH"}]
+                                        ]
+                                    }
+                                    send_message(chat_id, f"✅ **Chapter + Sub-topics Locked!**\n\n🎯 **Step 3:** Select Starting Difficulty Level:", reply_markup=keyboard)
+                                else:
+                                    send_message(chat_id, "⚠️ Usage: `/chapter Chapter Name | Subtopic 1, Subtopic 2`")
+
                         elif text.startswith("/link_group"):
                             if is_group_chat(chat_id):
                                 send_message(chat_id, "⚠️ Send `/link_group` in **Bot DM**!")
@@ -944,7 +1052,7 @@ def handle_updates():
                             try:
                                 target_id = int(text.replace("/link_group", "").strip())
                                 database.set_user_linked_group(user_id, target_id)
-                                send_message(chat_id, f"🎉 **Target Group Saved Permanently in Database!**\n\n🆔 **Target Group ID:** `{target_id}`\n\n*Ab aapko baar-baar link karne ki zaroorat nahi padegi!*")
+                                send_message(chat_id, f"🎉 **Target Group Saved Permanently in Database!**\n\n🆔 **Target Group ID:** `{target_id}`\n\n*Ab aapko baar-baar link karne ki zaroorat nahi padegi — quiz ho, schedule ho ya kuch bhi, hamesha yehi group use hoga!*")
                             except Exception:
                                 send_message(chat_id, "⚠️ **Invalid Format!** Use: `/link_group -100123456789`")
 
@@ -952,11 +1060,12 @@ def handle_updates():
                             if is_group_chat(chat_id):
                                 send_message(chat_id, "⚠️ Please use `/schedule` in **Bot DM**.")
                                 continue
-                            if not linked_grp:
+                            target_grp_for_schedule = resolve_target_group(user_id, chat_id)
+                            if not target_grp_for_schedule:
                                 send_message(chat_id, "⚠️ **No group linked yet!**\nFirst send: `/link_group <GroupID>` in DM.")
                                 continue
 
-                            schedule_wizard_state[user_id] = {"group_id": linked_grp}
+                            schedule_wizard_state[user_id] = {"group_id": target_grp_for_schedule}
                             st = schedule_wizard_state[user_id]
                             summary = get_wizard_summary(st)
                             keyboard = {
@@ -971,7 +1080,7 @@ def handle_updates():
 
                         elif text in ["/dashboard", "/panel"]:
                             if get_role(user_id) in ["owner", "admin"]:
-                                send_message(chat_id, "🎛️ **CA VAULT — OWNER CONTROL PANEL**\nSelect an option below to manage settings & access:", reply_markup=build_dashboard_keyboard())
+                                send_message(chat_id, f"{fancy_header('🎛️', 'CA VAULT — OWNER CONTROL PANEL')}\nSelect an option below to manage settings & access:", reply_markup=build_dashboard_keyboard())
                             else:
                                 send_message(chat_id, "🔒 Permission Denied: Owner/Admin role required.")
 
@@ -985,7 +1094,7 @@ def handle_updates():
                                     database.add_smart_keyword(kw, link, teacher_name=t_name, created_by=user_id)
                                     send_message(chat_id, f"✅ **Smart Keyword Added!**\n🏷️ Keyword: `{kw}`\n🔗 Link: `{link}`\n👨‍🏫 Teacher: `{t_name}`")
                                 except Exception:
-                                    send_message(chat_id, "⚠️ Format: `/addkeyword #ashish_law_notes | [https://t.me/channel/102](https://t.me/channel/102) | Ashish Sir`")
+                                    send_message(chat_id, "⚠️ Format: `/addkeyword #ashish_law_notes | https://t.me/channel/102 | Ashish Sir`")
 
                         elif text == "/keywords":
                             kws = database.search_smart_keywords()
@@ -1011,6 +1120,15 @@ def handle_updates():
                                     database.set_daily_quiz_time(today_str, time_arg)
                                     database.set_setting("default_time", time_arg)
                                     send_message(chat_id, f"✅ **Daily Quiz Time Updated!**\n⏰ New Time: `{time_arg}` PM")
+
+                        elif text.startswith("/setmode"):
+                            if get_role(user_id) in ["owner", "admin"]:
+                                mode_arg = text.replace("/setmode", "").strip().lower()
+                                if mode_arg in ["auto", "manual"]:
+                                    database.set_setting("mode", mode_arg)
+                                    send_message(chat_id, f"⚡ **Engine Mode Updated!** Now running in `{mode_arg.upper()}` mode.")
+                                else:
+                                    send_message(chat_id, "⚠️ Usage: `/setmode auto` or `/setmode manual`")
 
                         elif text.startswith("/parse"):
                             if get_role(user_id) in ["owner", "admin"]:
@@ -1064,6 +1182,10 @@ def handle_updates():
                                 send_message(chat_id, "🔒 **Quiz Access Restricted:** Approval request sent to Bot Owner!")
                                 continue
 
+                            # If run directly inside a group, remember this group for the user forever
+                            # so DM-based features (schedule, instant quiz) never need re-linking.
+                            resolve_target_group(user_id, chat_id)
+
                             quiz_builder_state[chat_id] = {"subject": "Accounts", "chapter": "", "level": "EXTREME_HIGH", "break_freq": 0, "break_duration": 0, "conductor_id": user_id}
                             keyboard = {
                                 "inline_keyboard": [
@@ -1073,7 +1195,7 @@ def handle_updates():
                                     [{"text": "💼 Economics", "callback_data": "sub_Economics"}]
                                 ]
                             }
-                            send_message(chat_id, "🎯 **Step 1:** Select Subject:", reply_markup=keyboard)
+                            send_message(chat_id, f"{fancy_header('🎯', 'INSTANT QUIZ WIZARD')}\n\n📘 **Step 1:** Select Subject:", reply_markup=keyboard)
 
                         elif text.startswith("/start") or text == "/menu":
                             t, kb = build_main_home_ui(first_name, linked_grp)
@@ -1090,7 +1212,7 @@ def handle_updates():
                         data_cb = query["data"]
                         user_id = query["from"]["id"]
                         first_name = query["from"].get("first_name", "Student")
-                        
+
                         requests.post(f"{BASE_URL}/answerCallbackQuery", json={"callback_query_id": query["id"]}, timeout=8)
                         linked_grp = database.get_user_linked_group(user_id)
 
@@ -1100,30 +1222,31 @@ def handle_updates():
 
                         elif data_cb == "ui_link_group_info":
                             info_text = (
-                                f"🔗 **PERMANENT GROUP LINKING SYSTEM**\n"
-                                f"✨ ══════════════════════════ ✨\n\n"
+                                f"{fancy_header('🔗', 'PERMANENT GROUP LINKING SYSTEM')}\n\n"
                                 f"Current Saved Group: `{linked_grp or 'None'}`\n\n"
                                 f"📝 **Kaise Link Karein:**\n"
                                 f"1. Bot ko apne Telegram Group mein Admin banayein.\n"
                                 f"2. Group ka Chat ID copy karein (e.g. `-100123456789`).\n"
                                 f"3. DM mein bhejein: `/link_group <GroupID>`\n\n"
-                                f"*Ek baar set karne ke baad bot hamesha ke liye database mein group ko yaad rakhega!*"
+                                f"*Ek baar set karne ke baad bot hamesha ke liye database mein group ko yaad rakhega — quiz, scheduler, sab isi group ko use karenge, dobara link karne ki zaroorat nahi!*"
                             )
                             kb = {"inline_keyboard": [[{"text": "🔙 Back to Home OS", "callback_data": "ui_home"}]]}
                             edit_message(query_chat_id, message_id, info_text, reply_markup=kb)
 
                         elif data_cb == "ui_quiz_start":
-                            if not linked_grp:
+                            target_grp = resolve_target_group(user_id, query_chat_id)
+                            if not target_grp:
                                 edit_message(query_chat_id, message_id, "⚠️ **No Group Linked!**\nPehle DM mein `/link_group <GroupId>` bhej kar group link karein.", reply_markup={"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "ui_home"}]]})
                             else:
-                                edit_message(query_chat_id, message_id, f"🚀 **Session Dispatched!**\nQuiz running live in Target Group (`{linked_grp}`).", reply_markup={"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "ui_home"}]]})
-                                threading.Thread(target=run_quiz_session, args=(linked_grp, "Accounts", "", 5, 20, 0, 0, "EXTREME_HIGH", user_id), daemon=True).start()
+                                edit_message(query_chat_id, message_id, f"🚀 **Session Dispatched!**\nQuiz running live in Target Group (`{target_grp}`).", reply_markup={"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "ui_home"}]]})
+                                threading.Thread(target=run_quiz_session, args=(target_grp, "Accounts", "", 5, 20, 0, 0, "EXTREME_HIGH", user_id), daemon=True).start()
 
                         elif data_cb == "ui_schedule_wizard":
-                            if not linked_grp:
+                            target_grp = resolve_target_group(user_id, query_chat_id)
+                            if not target_grp:
                                 edit_message(query_chat_id, message_id, "⚠️ **No Group Linked!**\nPehle DM mein `/link_group <GroupId>` bhej kar group link karein.", reply_markup={"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "ui_home"}]]})
                             else:
-                                schedule_wizard_state[user_id] = {"group_id": linked_grp}
+                                schedule_wizard_state[user_id] = {"group_id": target_grp}
                                 st = schedule_wizard_state[user_id]
                                 summary = get_wizard_summary(st)
                                 keyboard = {
@@ -1136,6 +1259,23 @@ def handle_updates():
                                     ]
                                 }
                                 edit_message(query_chat_id, message_id, f"{summary}🗓️ **AUTO SCHEDULER WIZARD**\n\n📘 **Step 1:** Select Subject:", reply_markup=keyboard)
+
+                        elif data_cb == "ui_hub":
+                            kws = database.search_smart_keywords()
+                            k_msg = f"{fancy_header('📚', 'SMART KNOWLEDGE HUB')}\n\n"
+                            if kws:
+                                for k in kws:
+                                    k_msg += f"• **{k['keyword']}** ({k['teacher_name'] or 'General'}): {k['channel_link']}\n"
+                            else:
+                                k_msg += "_No keywords indexed yet._"
+                            kb = {"inline_keyboard": [[{"text": "🔙 Back to Home OS", "callback_data": "ui_home"}]]}
+                            edit_message(query_chat_id, message_id, k_msg, reply_markup=kb)
+
+                        elif data_cb == "ui_leaderboard":
+                            edit_message(query_chat_id, message_id, "🏆 **LEADERBOARD**\n\nUse `/leaderboard` for the full ranked list.", reply_markup={"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "ui_home"}]]})
+
+                        elif data_cb == "ui_settings":
+                            edit_message(query_chat_id, message_id, "⚙️ **SYSTEM SETTINGS**\n\nUse `/dashboard` (Owner/Admin) for full control.", reply_markup={"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "ui_home"}]]})
 
                         # --- LIVE INTERACTIVE QUIZ STEPPER WIZARD ---
                         elif data_cb.startswith("sub_"):
@@ -1202,6 +1342,20 @@ def handle_updates():
                             }
                             edit_message(query_chat_id, message_id, "⚡ Mode: **Non-stop**\n\n⏱️ **Step 6:** Select Timer per Question:", reply_markup=keyboard)
 
+                        elif data_cb.startswith("break_"):
+                            parts = data_cb.split("_")
+                            freq = int(parts[1])
+                            mins = int(parts[2])
+                            quiz_builder_state[query_chat_id]["break_freq"] = freq
+                            quiz_builder_state[query_chat_id]["break_duration"] = mins * 60
+                            keyboard = {
+                                "inline_keyboard": [
+                                    [{"text": "20s", "callback_data": "timer_20"}, {"text": "30s", "callback_data": "timer_30"}],
+                                    [{"text": "45s", "callback_data": "timer_45"}, {"text": "60s", "callback_data": "timer_60"}]
+                                ]
+                            }
+                            edit_message(query_chat_id, message_id, f"☕ Break: **Every {freq} Qs ({mins} min)**\n\n⏱️ **Step 6:** Select Timer per Question:", reply_markup=keyboard)
+
                         elif data_cb.startswith("timer_"):
                             tmr = int(data_cb.split("_")[1])
                             state = quiz_builder_state.get(query_chat_id, {})
@@ -1213,9 +1367,11 @@ def handle_updates():
                             bd = state.get("break_duration", 0)
                             lvl = state.get("level", "EXTREME_HIGH")
                             cond_id = state.get("conductor_id")
-                            
-                            edit_message(query_chat_id, message_id, f"🚀 **Starting Quiz...**\n\n📘 Subject: `{subj}`\n🔢 Questions: `{cnt}`\n⏱️ Timer: `{tmr}s`")
-                            threading.Thread(target=run_quiz_session, args=(linked_grp or query_chat_id, subj, chap, cnt, tmr, bf, bd, lvl, cond_id, subtop), daemon=True).start()
+
+                            target_grp = resolve_target_group(cond_id or user_id, query_chat_id)
+
+                            edit_message(query_chat_id, message_id, f"🚀 **Starting Quiz...**\n\n📘 Subject: `{subj}`\n🔢 Questions: `{cnt}`\n⏱️ Timer: `{tmr}s`\n📌 Target: `{target_grp}`")
+                            threading.Thread(target=run_quiz_session, args=(target_grp or query_chat_id, subj, chap, cnt, tmr, bf, bd, lvl, cond_id, subtop), daemon=True).start()
 
                         # --- SCHEDULER WIZARD CALLBACKS ---
                         elif data_cb.startswith("swiz_sub_"):
@@ -1283,7 +1439,7 @@ def handle_updates():
                         elif data_cb.startswith("swiz_tmr_"):
                             tmr = int(data_cb.split("swiz_tmr_")[1])
                             st = schedule_wizard_state.get(query_chat_id, {})
-                            target_grp = st.get("group_id")
+                            target_grp = st.get("group_id") or resolve_target_group(query_chat_id, None)
                             subj = st.get("subject", "Accounts")
                             chap = st.get("chapter", "")
                             subtop = st.get("subtopics", "")
@@ -1327,8 +1483,8 @@ def handle_updates():
                                 pin_message(target_grp, res_msg["result"]["message_id"])
 
                             edit_message(
-                                query_chat_id, 
-                                message_id, 
+                                query_chat_id,
+                                message_id,
                                 f"🎉 **Schedule Created & Announced!**\n\n"
                                 f"📌 Group ID: `{target_grp}`\n"
                                 f"📘 Subject: `{subj}` (`{chap_text}`)\n"
@@ -1342,7 +1498,7 @@ def handle_updates():
                             database.update_approval_status(app_id, "approved")
                             app_info = database.get_pending_approval_by_id(app_id)
                             database.add_pdf_to_vault(app_info["file_id"], app_info["file_name"], app_info["uploaded_by"])
-                            database.add_smart_keyword(app_info["suggested_keyword"], "[https://t.me/CAVaultStudy/100](https://t.me/CAVaultStudy/100)", teacher_name="Approved Material")
+                            database.add_smart_keyword(app_info["suggested_keyword"], "https://t.me/CAVaultStudy/100", teacher_name="Approved Material")
                             edit_message(query_chat_id, message_id, f"✅ **APPROVED & PUBLISHED!**\n📄 File: `{app_info['file_name']}`\n🏷️ Keyword: `{app_info['suggested_keyword']}` indexed.")
 
                         elif data_cb == "app_rej":
