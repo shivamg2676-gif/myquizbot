@@ -30,6 +30,10 @@ quiz_report_tracker = {}  # chat_id -> list of per-question stat dicts (for end-
 # Permanent mapping: user_id -> linked_group_id
 user_linked_groups = {}
 
+# Permanent mapping: group_id -> "HH:MM" (24h) daily time to post "Today's Quiz" announcement
+group_reminder_time = {}
+_reminder_sent_tracker = {}  # group_id -> date string already announced today (in-memory only)
+
 SUBJECTS = ["Accounts", "Business Laws", "Quantitative Aptitude", "Economics"]
 
 print("CA Vault Direct Execution Quiz Bot Starting...")
@@ -112,7 +116,9 @@ def load_persisted_data():
         loaded_links = data.get("linked_groups", {})
         user_linked_groups.update({int(k): v for k, v in loaded_links.items()})
         scheduled_quizzes.extend(data.get("scheduled_quizzes", []))
-        print(f"Loaded {len(user_linked_groups)} linked group(s) and {len(scheduled_quizzes)} scheduled quiz job(s) from disk.")
+        loaded_reminders = data.get("group_reminder_time", {})
+        group_reminder_time.update({int(k): v for k, v in loaded_reminders.items()})
+        print(f"Loaded {len(user_linked_groups)} linked group(s), {len(scheduled_quizzes)} scheduled quiz job(s), {len(group_reminder_time)} reminder setting(s) from disk.")
     except Exception as e:
         print(f"Could not load persisted data: {e}")
 
@@ -122,7 +128,8 @@ def save_persisted_data():
             with open(DATA_FILE, "w") as f:
                 json.dump({
                     "linked_groups": user_linked_groups,
-                    "scheduled_quizzes": scheduled_quizzes
+                    "scheduled_quizzes": scheduled_quizzes,
+                    "group_reminder_time": group_reminder_time
                 }, f)
         except Exception as e:
             print(f"Could not save persisted data: {e}")
@@ -319,21 +326,21 @@ def run_quiz_session(target_chat_id, subject, chapter, count, timer, break_freq=
     break_info = f"Break: Every `{break_freq}` Qs for `{break_duration//60}` min" if break_freq > 0 else "Mode: Non-stop (No Breaks)"
 
     start_msg = (
-        f"CA VAULT — LIVE QUIZ SESSION\n"
+        f"🎯 *CA VAULT — LIVE QUIZ SESSION*\n"
         f"────────────────────────\n"
-        f"Subject: `{subject}`\n"
-        f"Chapter: `{chap_display}`{subtopic_display}\n"
-        f"Questions: `{count}`  |  Timer: `{timer}s`\n"
-        f"{break_info}\n"
+        f"📘 Subject: `{subject}`\n"
+        f"📖 Chapter: `{chap_display}`{subtopic_display}\n"
+        f"🔢 Questions: `{count}`  |  ⏱ Timer: `{timer}s`\n"
+        f"☕ {break_info}\n"
         f"────────────────────────\n"
-        f"Quiz starting now. All the best!"
+        f"🚀 Quiz starting now. All the best!"
     )
     send_message(target_chat_id, start_msg)
 
     current_difficulty = level
 
     if conductor_user_id:
-        send_message(conductor_user_id, f"*Quiz Started* in group `{target_chat_id}`\nStarting level: `{current_difficulty}`\nA full performance report will be sent here once the quiz ends.")
+        send_message(conductor_user_id, f"🚀 *Quiz Started* in group `{target_chat_id}`\n🔥 Starting level: `{current_difficulty}`\n📊 A full performance report will be sent here once the quiz ends.")
 
     for idx in range(count):
         if not active_quiz_sessions.get(target_chat_id, False):
@@ -388,7 +395,7 @@ def run_quiz_session(target_chat_id, subject, chapter, count, timer, break_freq=
         time.sleep(2)
 
     active_quiz_sessions[target_chat_id] = False
-    send_message(target_chat_id, f"QUIZ COMPLETE\n\nSubject: `{subject}`\nTotal Questions: `{count}`")
+    send_message(target_chat_id, f"🎉 *QUIZ COMPLETE*\n\n📘 Subject: `{subject}`\n🔢 Total Questions: `{count}`")
 
     if conductor_user_id:
         send_message(conductor_user_id, build_performance_report(subject, chap_display, quiz_report_tracker.get(target_chat_id, [])))
@@ -398,7 +405,7 @@ def run_quiz_session(target_chat_id, subject, chapter, count, timer, break_freq=
 def build_performance_report(subject, chapter, report_rows):
     """Builds a single consolidated performance report, sent once the quiz has finished."""
     if not report_rows:
-        return "*QUIZ PERFORMANCE REPORT*\nNo votes were recorded for this quiz."
+        return "📊 *QUIZ PERFORMANCE REPORT*\nNo votes were recorded for this quiz."
 
     total_q = len(report_rows)
     total_votes = sum(r["total_votes"] for r in report_rows)
@@ -409,12 +416,12 @@ def build_performance_report(subject, chapter, report_rows):
     toughest = max(report_rows, key=lambda r: r["wrong_pct"]) if any(r["total_votes"] > 0 for r in report_rows) else None
 
     lines = [
-        "*QUIZ PERFORMANCE REPORT*",
+        "📊 *QUIZ PERFORMANCE REPORT*",
         "────────────────────────",
-        f"Subject: `{subject}` ({chapter})",
-        f"Questions Conducted: `{total_q}`",
-        f"Final Difficulty Level: `{final_difficulty}`",
-        f"Overall Accuracy: `{overall_accuracy:.1f}%`  |  Overall Wrong: `{overall_wrong_pct:.1f}%`",
+        f"📘 Subject: `{subject}` ({chapter})",
+        f"🔢 Questions Conducted: `{total_q}`",
+        f"🔥 Final Difficulty Level: `{final_difficulty}`",
+        f"✅ Overall Accuracy: `{overall_accuracy:.1f}%`  |  ❌ Overall Wrong: `{overall_wrong_pct:.1f}%`",
         "────────────────────────",
         "*Question-wise Breakdown:*"
     ]
@@ -423,9 +430,45 @@ def build_performance_report(subject, chapter, report_rows):
 
     if toughest and toughest["total_votes"] > 0:
         lines.append("────────────────────────")
-        lines.append(f"Toughest Question: Q{toughest['q_no']} (`{toughest['wrong_pct']:.1f}%` wrong)")
+        lines.append(f"🧩 Toughest Question: Q{toughest['q_no']} (`{toughest['wrong_pct']:.1f}%` wrong)")
 
     return "\n".join(lines)
+
+# --- "TODAY'S QUIZ" DAILY GROUP ANNOUNCEMENT ---
+
+def build_today_announcement(jobs):
+    jobs_sorted = sorted(jobs, key=lambda j: j["datetime"])
+    lines = [
+        "📢 *TODAY'S QUIZ SCHEDULE*",
+        "────────────────────────"
+    ]
+    for j in jobs_sorted:
+        try:
+            dt_obj = datetime.strptime(j["datetime"], "%Y-%m-%d %H:%M")
+            time_disp = dt_obj.strftime("%I:%M %p")
+        except Exception:
+            time_disp = j["datetime"]
+        chap = j.get("chapter") or "Full Syllabus"
+        lines.append(f"🕐 `{time_disp}`  —  📘 *{j['subject']}* ({chap})  —  🔢 `{j['count']}` Qs")
+    lines.append("────────────────────────")
+    lines.append("Quizzes will start automatically at the time(s) shown above. Good luck! 🎯")
+    return "\n".join(lines)
+
+def daily_reminder_worker():
+    while True:
+        try:
+            now = datetime.now()
+            current_hm = now.strftime("%H:%M")
+            today_str = now.strftime("%Y-%m-%d")
+            for group_id, rem_time in list(group_reminder_time.items()):
+                if rem_time == current_hm and _reminder_sent_tracker.get(group_id) != today_str:
+                    todays_jobs = [j for j in scheduled_quizzes if j.get("chat_id") == group_id and j["datetime"].startswith(today_str)]
+                    if todays_jobs:
+                        send_message(group_id, build_today_announcement(todays_jobs))
+                    _reminder_sent_tracker[group_id] = today_str
+        except Exception:
+            pass
+        time.sleep(30)
 
 # --- BACKGROUND SCHEDULER WORKER ---
 
@@ -459,17 +502,20 @@ def scheduler_background_worker():
 
 def get_help_text():
     return (
-        "*CA VAULT QUIZ BOT — CONTROL PANEL*\n\n"
-        "*Group Commands*\n"
-        "`/quiz` — Launch interactive live quiz setup\n"
-        "`/stopquiz` — Stop the active quiz\n"
-        "`/myid` — Show this group's Chat ID\n\n"
-        "*DM Control Wizard (Bot DM only)*\n"
-        "`/link_group <GroupID>` — Link your group once (stays linked)\n"
-        "`/schedule` — Guided scheduler wizard\n"
-        "     • One-time custom date & time (AM/PM)\n"
-        "     • Recurring daily preset/custom slots\n"
-        "`/myschedules` — View / cancel upcoming scheduled quizzes"
+        "🦅 *CA VAULT QUIZ BOT — CONTROL PANEL*\n"
+        "────────────────────────\n\n"
+        "👥 *Group Commands*\n"
+        "▸ `/quiz` — Launch interactive live quiz setup\n"
+        "▸ `/stopquiz` — Stop the active quiz\n"
+        "▸ `/myid` — Show this group's Chat ID\n\n"
+        "💬 *DM Control Wizard (Bot DM only)*\n"
+        "▸ `/link_group <GroupID>` — Link your group once (stays linked forever)\n"
+        "▸ `/schedule` — Guided scheduler wizard\n"
+        "      📅 One-time custom date & time (AM/PM)\n"
+        "      🔁 Recurring daily preset/custom slots\n"
+        "▸ `/myschedules` — View your upcoming scheduled quizzes\n"
+        "▸ `/reminder` — Set the daily \"Today's Quiz\" announcement time\n\n"
+        "📊 *After every quiz:* a full performance report is DM'd to whoever started it."
     )
 
 # --- WIZARD HELPER TO BUILD SUMMARY TEXT ---
@@ -481,24 +527,24 @@ def get_wizard_summary(st):
     lvl = st.get("level", "Not Selected")
     mode = st.get("schedule_mode")
     if mode == "onetime":
-        schedule_line = f"Date/Time: `{st.get('display_datetime', 'Not Selected')}`"
+        schedule_line = f"📅 Date/Time: `{st.get('display_datetime', 'Not Selected')}`"
     else:
         slots = ", ".join(st.get("slots", [])) if st.get("slots") else "Not Selected"
-        schedule_line = f"Daily Slots: `{slots}`"
+        schedule_line = f"🔁 Daily Slots: `{slots}`"
     cnt = st.get("count", "Not Selected")
     tmr = st.get("timer", "Not Selected")
 
     return (
-        f"*CURRENT SCOPE SUMMARY*\n"
+        f"📊 *CURRENT SCOPE SUMMARY*\n"
         f"────────────────────────\n"
-        f"Group: `{grp}`\n"
-        f"Subject: `{subj}`\n"
-        f"Chapter: `{chap or 'Full Subject Syllabus'}`\n"
-        f"Sub-topics: `{subtop or 'None'}`\n"
-        f"Difficulty: `{lvl}`\n"
+        f"📌 Group: `{grp}`\n"
+        f"📘 Subject: `{subj}`\n"
+        f"📖 Chapter: `{chap or 'Full Subject Syllabus'}`\n"
+        f"🎯 Sub-topics: `{subtop or 'None'}`\n"
+        f"🔥 Difficulty: `{lvl}`\n"
         f"{schedule_line}\n"
-        f"Questions: `{cnt}`\n"
-        f"Timer/Question: `{tmr}`\n"
+        f"🔢 Questions: `{cnt}`\n"
+        f"⏱ Timer/Question: `{tmr}`\n"
         f"────────────────────────\n"
     )
 
@@ -570,13 +616,13 @@ def handle_updates():
 
                         if text.startswith("/start"):
                             welcome_msg = (
-                                "*Welcome to CA Vault Quiz Engine*\n\n"
-                                "High-yield, AI-generated practice quizzes for CA Foundation.\n\n"
-                                "Tap below to open the control menu."
+                                "🦅 *Welcome to CA Vault Quiz Engine*\n\n"
+                                "⚡ High-yield, AI-generated practice quizzes for CA Foundation.\n\n"
+                                "Tap below to open the control menu 👇"
                             )
                             keyboard = {
                                 "inline_keyboard": [
-                                    [{"text": "Open Help Menu", "callback_data": "show_help_menu"}]
+                                    [{"text": "📖 Open Help Menu", "callback_data": "show_help_menu"}]
                                 ]
                             }
                             send_message(chat_id, welcome_msg, reply_markup=keyboard)
@@ -611,9 +657,13 @@ def handle_updates():
                                 send_message(chat_id, "You have no upcoming scheduled quizzes.")
                                 continue
                             my_jobs_sorted = sorted(my_jobs, key=lambda j: j["datetime"])[:20]
-                            lines = ["*YOUR UPCOMING SCHEDULED QUIZZES*", "────────────────────────"]
+                            lines = ["📅 *YOUR UPCOMING SCHEDULED QUIZZES*", "────────────────────────"]
                             for j in my_jobs_sorted:
-                                lines.append(f"`{j['datetime']}` — {j['subject']} ({j.get('chapter') or 'Full Syllabus'}) — {j['count']} Qs")
+                                try:
+                                    dt_disp = datetime.strptime(j["datetime"], "%Y-%m-%d %H:%M").strftime("%Y-%m-%d, %I:%M %p")
+                                except Exception:
+                                    dt_disp = j["datetime"]
+                                lines.append(f"🕐 `{dt_disp}` — 📘 {j['subject']} ({j.get('chapter') or 'Full Syllabus'}) — 🔢 {j['count']} Qs")
                             if len(my_jobs) > 20:
                                 lines.append(f"...and {len(my_jobs) - 20} more.")
                             send_message(chat_id, "\n".join(lines))
@@ -778,10 +828,51 @@ def handle_updates():
                             try:
                                 target_group_id = int(text.replace("/link_group", "").strip())
                                 user_linked_groups[user_id] = target_group_id
+                                if target_group_id not in group_reminder_time:
+                                    group_reminder_time[target_group_id] = "08:00"
                                 save_persisted_data()
-                                send_message(chat_id, f"*Group Linked Successfully*\n\nGroup ID: `{target_group_id}`\n\nThis link is saved — you will not need to link again. Type `/schedule` any time to open the scheduler wizard.")
+                                send_message(chat_id, f"✅ *Group Linked Successfully*\n\n📌 Group ID: `{target_group_id}`\n⏰ Daily \"Today's Quiz\" reminder: `08:00 AM` (change with `/reminder`)\n\nThis link is saved permanently — you will not need to link again. Type `/schedule` any time to open the scheduler wizard.")
                             except Exception:
-                                send_message(chat_id, "Invalid format.\nUse: `/link_group -100123456789`\n\n(Tip: send `/myid` in the group to copy its Group ID)")
+                                send_message(chat_id, "⚠️ Invalid format.\nUse: `/link_group -100123456789`\n\n(Tip: send `/myid` in the group to copy its Group ID)")
+
+                        elif text == "/reminder":
+                            if is_group_chat(chat_id):
+                                send_message(chat_id, "Please use `/reminder` in Bot DM.")
+                                continue
+                            if user_id not in user_linked_groups:
+                                send_message(chat_id, "⚠️ No group linked yet.\nFirst send: `/link_group <GroupID>`")
+                                continue
+                            grp = user_linked_groups[user_id]
+                            current = group_reminder_time.get(grp, "08:00")
+                            current_disp = datetime.strptime(current, "%H:%M").strftime("%I:%M %p")
+                            keyboard = {
+                                "inline_keyboard": [
+                                    [{"text": "07:00 AM", "callback_data": "rem_07:00"}, {"text": "08:00 AM", "callback_data": "rem_08:00"}],
+                                    [{"text": "09:00 AM", "callback_data": "rem_09:00"}, {"text": "06:00 PM", "callback_data": "rem_18:00"}],
+                                    [{"text": "Custom (type it)", "callback_data": "rem_custom_prompt"}]
+                                ]
+                            }
+                            send_message(
+                                chat_id,
+                                f"⏰ *DAILY \"TODAY'S QUIZ\" REMINDER*\n────────────────────────\n📌 Group: `{grp}`\n🕐 Current Time: `{current_disp}`\n\n"
+                                f"Every day at this time, if a quiz is scheduled for that day, the bot posts a \"Today's Quiz\" announcement in your group with subject, question count & time.\n\n"
+                                f"Choose a new time:",
+                                reply_markup=keyboard
+                            )
+
+                        elif text.startswith("/setreminder_custom"):
+                            if user_id in user_linked_groups:
+                                raw = text.replace("/setreminder_custom", "").strip().upper()
+                                try:
+                                    t_obj = datetime.strptime(raw, "%I:%M %p")
+                                    grp = user_linked_groups[user_id]
+                                    group_reminder_time[grp] = t_obj.strftime("%H:%M")
+                                    save_persisted_data()
+                                    send_message(chat_id, f"✅ Daily reminder time updated to `{t_obj.strftime('%I:%M %p')}` for group `{grp}`.")
+                                except Exception:
+                                    send_message(chat_id, "⚠️ Invalid format. Use: `/setreminder_custom 08:30 AM`")
+                            else:
+                                send_message(chat_id, "⚠️ No group linked yet.\nFirst send: `/link_group <GroupID>`")
 
                         elif text == "/schedule":
                             if is_group_chat(chat_id):
@@ -852,6 +943,20 @@ def handle_updates():
 
                         if data_cb == "show_help_menu":
                             edit_message(query_chat_id, message_id, get_help_text())
+
+                        elif data_cb == "rem_custom_prompt":
+                            edit_message(query_chat_id, message_id, "Send the exact reminder time as a command:\n`/setreminder_custom 08:30 AM`")
+
+                        elif data_cb.startswith("rem_"):
+                            time_val = data_cb.split("rem_")[1]
+                            grp = user_linked_groups.get(cb_user_id)
+                            if grp:
+                                group_reminder_time[grp] = time_val
+                                save_persisted_data()
+                                disp = datetime.strptime(time_val, "%H:%M").strftime("%I:%M %p")
+                                edit_message(query_chat_id, message_id, f"✅ Daily reminder time set to `{disp}` for group `{grp}`.\n\nThe bot will post \"Today's Quiz\" there each day at this time, whenever a quiz is scheduled.")
+                            else:
+                                edit_message(query_chat_id, message_id, "⚠️ No group linked. Send `/link_group <GroupID>` first.")
 
                         # --- LIVE QUIZ BUILDER BACK NAVIGATION & FLOW ---
                         elif data_cb == "start_interactive_quiz":
@@ -1154,6 +1259,9 @@ def finalize_schedule_wizard(chat_id, user_id, tmr, message_id=None):
     chap_text = chap if chap else "Full Subject Syllabus"
     subtop_text = f"\nSubtopics: `{subtop}`" if subtop else ""
 
+    if target_grp not in group_reminder_time:
+        group_reminder_time[target_grp] = "08:00"
+
     if mode == "onetime":
         run_dt = st.get("custom_datetime")
         if not run_dt:
@@ -1195,25 +1303,26 @@ def finalize_schedule_wizard(chat_id, user_id, tmr, message_id=None):
         announcement_schedule_line = f"Daily Time Slots: `{', '.join(slots)}`"
 
     announcement_text = (
-        f"SCHEDULED QUIZ ANNOUNCEMENT\n"
+        f"📢 *SCHEDULED QUIZ ANNOUNCEMENT*\n"
         f"────────────────────────\n"
-        f"Subject: `{subj}`\n"
-        f"Scope: `{chap_text}`{subtop_text}\n"
+        f"📘 Subject: `{subj}`\n"
+        f"📖 Scope: `{chap_text}`{subtop_text}\n"
         f"{announcement_schedule_line}\n"
-        f"Questions/Quiz: `{cnt}`  |  Timer: `{tmr}s`\n"
+        f"🔢 Questions/Quiz: `{cnt}`  |  ⏱ Timer: `{tmr}s`\n"
         f"────────────────────────\n"
-        f"Quizzes will start automatically at the scheduled time(s)."
+        f"🚀 Quizzes will start automatically at the scheduled time(s).\n"
+        f"📌 A reminder will also be posted here on the day of each quiz."
     )
     res_msg = send_message(target_grp, announcement_text)
     if res_msg.get("ok"):
         pin_message(target_grp, res_msg["result"]["message_id"])
 
     final_text = (
-        f"*Schedule Created & Announced*\n\n"
-        f"Group ID: `{target_grp}`\n"
-        f"Subject: `{subj}` (`{chap_text}`)\n"
+        f"🎉 *Schedule Created & Announced*\n\n"
+        f"📌 Group ID: `{target_grp}`\n"
+        f"📘 Subject: `{subj}` (`{chap_text}`)\n"
         f"{schedule_line}\n\n"
-        f"Group announcement pinned successfully. Use `/myschedules` any time to review it."
+        f"✅ Group announcement pinned successfully. Use `/myschedules` any time to review it, or `/reminder` to change the daily announcement time."
     )
     if message_id:
         edit_message(chat_id, message_id, final_text)
@@ -1230,4 +1339,5 @@ if __name__ == "__main__":
 
     # Start Bot Tasks
     threading.Thread(target=scheduler_background_worker, daemon=True).start()
+    threading.Thread(target=daily_reminder_worker, daemon=True).start()
     handle_updates()
