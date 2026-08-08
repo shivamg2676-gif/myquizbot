@@ -299,6 +299,11 @@ def run_quiz_session(target_chat_id, subject, chapter, count, timer, break_freq=
     send_message(target_chat_id, start_msg)
     
     current_difficulty = level
+    
+    # Tracking Cumulative Quiz Performance Metrics
+    total_session_votes = 0
+    total_session_wrongs = 0
+    questions_attempted = 0
 
     if conductor_user_id:
         send_message(conductor_user_id, f"🚀 **Quiz Started in Group (`{target_chat_id}`)!**\nInitial Set Level: `{current_difficulty}`\nYou will receive live performance metrics here in DM.")
@@ -336,6 +341,10 @@ def run_quiz_session(target_chat_id, subject, chapter, count, timer, break_freq=
             total_v = p_data["total_votes"]
             wrong_v = p_data["wrong_count"]
             
+            questions_attempted += 1
+            total_session_votes += total_v
+            total_session_wrongs += wrong_v
+            
             wrong_percentage = (wrong_v / total_v * 100) if total_v > 0 else 0
             
             if total_v > 0 and wrong_percentage > 60:
@@ -361,9 +370,29 @@ def run_quiz_session(target_chat_id, subject, chapter, count, timer, break_freq=
         time.sleep(2)
 
     active_quiz_sessions[target_chat_id] = False
-    send_message(target_chat_id, f"🎉 **QUIZ COMPLETE!**\n\n📘 **Subject:** `{subject}`\n🔢 **Total Questions:** `{count}`")
+    
+    # Calculate Overall Session Analytics
+    overall_wrong_pct = (total_session_wrongs / total_session_votes * 100) if total_session_votes > 0 else 0
+    overall_correct_pct = 100.0 - overall_wrong_pct if total_session_votes > 0 else 0.0
+
+    summary_report = (
+        f"🏆 **QUIZ PERFORMANCE ANALYTICS REPORT**\n"
+        f"─────────────────────\n"
+        f"📌 **Group ID:** `{target_chat_id}`\n"
+        f"📘 **Subject:** `{subject}`\n"
+        f"📖 **Scope:** `{chap_display}`\n"
+        f"🔢 **Total Conducted Qs:** `{questions_attempted}/{count}`\n"
+        f"📥 **Total Group Votes:** `{total_session_votes}`\n"
+        f"❌ **Total Wrong Responses:** `{total_session_wrongs}` (`{overall_wrong_pct:.1f}%`)\n"
+        f"✅ **Group Accuracy Rate:** `{overall_correct_pct:.1f}%`\n"
+        f"🔥 **Final Adapted Difficulty:** `{current_difficulty}`\n"
+        f"─────────────────────"
+    )
+
+    send_message(target_chat_id, f"🎉 **QUIZ COMPLETE!**\n\n📘 **Subject:** `{subject}`\n🔢 **Total Questions:** `{questions_attempted}`\n\n{summary_report}")
+    
     if conductor_user_id:
-        send_message(conductor_user_id, f"🎉 **Quiz Complete in Group (`{target_chat_id}`)!**\nTotal Questions Conducted: `{count}`.")
+        send_message(conductor_user_id, f"🎉 **Quiz Complete Analytics for Group (`{target_chat_id}`):**\n\n{summary_report}")
 
 # --- BACKGROUND SCHEDULER WORKER ---
 
@@ -401,7 +430,8 @@ def get_help_text():
         "💬 **DM CONTROL WIZARD (BOT DM ONLY)**\n"
         "• `/link_group <GroupID>` — Link your group permanently\n"
         "• `/schedule` — Step-by-Step Guided Scheduler Wizard\n"
-        "  *(Set Subject, Chapter, Sub-topics, Level, Time Slots, Qs & Timer)*"
+        "• `/setschedule YYYY-MM-DD | HH:MM AM/PM` — Set exact date and time for quiz\n"
+        "  *(Set Subject, Chapter, Sub-topics, Level, Custom AM/PM Slot, Qs & Timer)*"
     )
 
 # --- WIZARD HELPER TO BUILD SUMMARY TEXT ---
@@ -411,8 +441,10 @@ def get_wizard_summary(st):
     chap = st.get("chapter", "Full Subject Syllabus")
     subtop = st.get("subtopics", "None")
     lvl = st.get("level", "Not Selected")
-    slots = ", ".join(st.get("slots", [])) if st.get("slots") else "Not Selected"
+    sch_date = st.get("schedule_date", "Not Selected")
+    sch_time = st.get("schedule_time", "Not Selected")
     cnt = st.get("count", "Not Selected")
+    tmr = st.get("timer", "Not Selected")
     
     return (
         f"📊 **CURRENT SCOPE SUMMARY**\n"
@@ -422,8 +454,10 @@ def get_wizard_summary(st):
         f"📖 **Chapter:** `{chap or 'Full Subject Syllabus'}`\n"
         f"🎯 **Sub-topics:** `{subtop or 'None'}`\n"
         f"🔥 **Difficulty:** `{lvl}`\n"
-        f"⏰ **Slots:** `{slots}`\n"
+        f"📅 **Date:** `{sch_date}`\n"
+        f"⏰ **Time:** `{sch_time}`\n"
         f"🔢 **Questions:** `{cnt}`\n"
+        f"⏱️ **Timer:** `{tmr}`\n"
         f"─────────────────────\n"
     )
 
@@ -601,6 +635,37 @@ def handle_updates():
                                     }
                                     send_message(target_chat_id, f"✅ **Chapter set:** `{chap_val}`\n🎯 **Sub-topics:** `{subtopic_val or 'All'}`\n\n🎯 **Step 3:** Select Difficulty Level:", reply_markup=keyboard)
 
+                        elif text.startswith("/setschedule"):
+                            if user_id in schedule_wizard_state:
+                                raw_val = text.replace("/setschedule", "").strip()
+                                if "|" in raw_val:
+                                    parts = raw_val.split("|")
+                                    date_val = parts[0].strip()
+                                    time_val = parts[1].strip().upper()
+                                    
+                                    try:
+                                        datetime.strptime(date_val, "%Y-%m-%d")
+                                        datetime.strptime(time_val, "%I:%M %p")
+                                        
+                                        schedule_wizard_state[user_id]["schedule_date"] = date_val
+                                        schedule_wizard_state[user_id]["schedule_time"] = time_val
+                                        
+                                        st = schedule_wizard_state[user_id]
+                                        summary = get_wizard_summary(st)
+                                        
+                                        keyboard = {
+                                            "inline_keyboard": [
+                                                [{"text": "10 Qs", "callback_data": "swiz_cnt_10"}, {"text": "20 Qs", "callback_data": "swiz_cnt_20"}],
+                                                [{"text": "30 Qs", "callback_data": "swiz_cnt_30"}, {"text": "50 Qs", "callback_data": "swiz_cnt_50"}],
+                                                [{"text": "⬅️ Back", "callback_data": "swiz_back_to_lvl"}]
+                                            ]
+                                        }
+                                        send_message(chat_id, f"{summary}✅ **Schedule Locked!**\n\n🔢 **Step 5:** Select Question Count per Quiz:", reply_markup=keyboard)
+                                    except ValueError:
+                                        send_message(chat_id, "⚠️ **Invalid Date or Time Format!**\nUse format: `/setschedule YYYY-MM-DD | hh:mm AM/PM`\nExample: `/setschedule 2026-08-10 | 06:30 PM`")
+                                else:
+                                    send_message(chat_id, "⚠️ **Missing separator (`|`)!**\nUse format: `/setschedule YYYY-MM-DD | hh:mm AM/PM`\nExample: `/setschedule 2026-08-10 | 06:30 PM`")
+
                         elif text.startswith("/link_group"):
                             if is_group_chat(chat_id):
                                 send_message(chat_id, "⚠️ Send `/link_group` in **Bot DM**!")
@@ -635,23 +700,6 @@ def handle_updates():
                                 ]
                             }
                             send_message(chat_id, f"{summary}🗓️ **SCHEDULER WIZARD**\n\n📘 **Step 1:** Select Subject:", reply_markup=keyboard)
-
-                        elif text.startswith("/slots"):
-                            if user_id in schedule_wizard_state:
-                                slots_val = text.replace("/slots", "").strip()
-                                slots_list = [s.strip() for s in slots_val.split(",") if s.strip()]
-                                schedule_wizard_state[user_id]["slots"] = slots_list
-                                st = schedule_wizard_state[user_id]
-                                summary = get_wizard_summary(st)
-                                
-                                keyboard = {
-                                    "inline_keyboard": [
-                                        [{"text": "10 Qs", "callback_data": "swiz_cnt_10"}, {"text": "20 Qs", "callback_data": "swiz_cnt_20"}],
-                                        [{"text": "30 Qs", "callback_data": "swiz_cnt_30"}, {"text": "50 Qs", "callback_data": "swiz_cnt_50"}],
-                                        [{"text": "⬅️ Back", "callback_data": "swiz_back_to_lvl"}]
-                                    ]
-                                }
-                                send_message(chat_id, f"{summary}\n🔢 **Step 5:** Select Question Count per Quiz:", reply_markup=keyboard)
 
                     elif "callback_query" in result:
                         query = result["callback_query"]
@@ -849,59 +897,15 @@ def handle_updates():
                             st = schedule_wizard_state[query_chat_id]
                             summary = get_wizard_summary(st)
                             
-                            keyboard = {
-                                "inline_keyboard": [
-                                    [{"text": "09:00, 15:00, 21:00", "callback_data": "slot_preset_1"}],
-                                    [{"text": "10:00, 14:00, 18:00, 22:00", "callback_data": "slot_preset_2"}],
-                                    [{"text": "✍️ Custom Slots", "callback_data": "slot_custom"}],
-                                    [{"text": "⬅️ Back", "callback_data": "swiz_chap_skip"}]
-                                ]
-                            }
-                            edit_message(query_chat_id, message_id, f"{summary}⏰ **Step 4:** Choose Daily Time Slots:", reply_markup=keyboard)
-
-                        elif data_cb == "swiz_back_to_lvl":
-                            st = schedule_wizard_state.get(query_chat_id, {})
-                            summary = get_wizard_summary(st)
-                            keyboard = {
-                                "inline_keyboard": [
-                                    [{"text": "⚡ MEDIUM", "callback_data": "swiz_lvl_MEDIUM"}],
-                                    [{"text": "🔥 HIGH", "callback_data": "swiz_lvl_HIGH"}],
-                                    [{"text": "💀 EXTREME HIGH", "callback_data": "swiz_lvl_EXTREME_HIGH"}],
-                                    [{"text": "⬅️ Back", "callback_data": "swiz_back_to_chap_choice"}]
-                                ]
-                            }
-                            edit_message(query_chat_id, message_id, f"{summary}🎯 **Step 3:** Select Starting Difficulty Level:", reply_markup=keyboard)
-
-                        elif data_cb == "slot_preset_1":
-                            schedule_wizard_state[query_chat_id]["slots"] = ["09:00", "15:00", "21:00"]
-                            st = schedule_wizard_state[query_chat_id]
-                            summary = get_wizard_summary(st)
-                            
-                            keyboard = {
-                                "inline_keyboard": [
-                                    [{"text": "10 Qs", "callback_data": "swiz_cnt_10"}, {"text": "20 Qs", "callback_data": "swiz_cnt_20"}],
-                                    [{"text": "30 Qs", "callback_data": "swiz_cnt_30"}, {"text": "50 Qs", "callback_data": "swiz_cnt_50"}],
-                                    [{"text": "⬅️ Back", "callback_data": "swiz_back_to_lvl"}]
-                                ]
-                            }
-                            edit_message(query_chat_id, message_id, f"{summary}🔢 **Step 5:** Select Question Count:", reply_markup=keyboard)
-
-                        elif data_cb == "slot_preset_2":
-                            schedule_wizard_state[query_chat_id]["slots"] = ["10:00", "14:00", "18:00", "22:00"]
-                            st = schedule_wizard_state[query_chat_id]
-                            summary = get_wizard_summary(st)
-                            
-                            keyboard = {
-                                "inline_keyboard": [
-                                    [{"text": "10 Qs", "callback_data": "swiz_cnt_10"}, {"text": "20 Qs", "callback_data": "swiz_cnt_20"}],
-                                    [{"text": "30 Qs", "callback_data": "swiz_cnt_30"}, {"text": "50 Qs", "callback_data": "swiz_cnt_50"}],
-                                    [{"text": "⬅️ Back", "callback_data": "swiz_back_to_lvl"}]
-                                ]
-                            }
-                            edit_message(query_chat_id, message_id, f"{summary}🔢 **Step 5:** Select Question Count:", reply_markup=keyboard)
-
-                        elif data_cb == "slot_custom":
-                            edit_message(query_chat_id, message_id, "✍️ Send command for custom slots:\n`/slots 09:00, 13:00, 18:00, 21:00`")
+                            today_str = datetime.now().strftime("%Y-%m-%d")
+                            edit_message(
+                                query_chat_id,
+                                message_id,
+                                f"{summary}📅 **Step 4:** Set Custom Schedule Date & Time (AM/PM):\n\n"
+                                f"Send command in this exact format:\n"
+                                f"`/setschedule YYYY-MM-DD | hh:mm AM/PM`\n\n"
+                                f"📌 *Example:* `/setschedule {today_str} | 07:30 PM`"
+                            )
 
                         elif data_cb.startswith("swiz_cnt_"):
                             cnt = int(data_cb.split("swiz_cnt_")[1])
@@ -913,7 +917,7 @@ def handle_updates():
                                 "inline_keyboard": [
                                     [{"text": "20s", "callback_data": "swiz_tmr_20"}, {"text": "30s", "callback_data": "swiz_tmr_30"}],
                                     [{"text": "45s", "callback_data": "swiz_tmr_45"}, {"text": "60s", "callback_data": "swiz_tmr_60"}],
-                                    [{"text": "⬅️ Back", "callback_data": "slot_preset_1"}]
+                                    [{"text": "⬅️ Back", "callback_data": "swiz_back_to_lvl"}]
                                 ]
                             }
                             edit_message(query_chat_id, message_id, f"{summary}⏱️ **Step 6:** Select Timer per Question:", reply_markup=keyboard)
@@ -926,46 +930,55 @@ def handle_updates():
                             chap = st.get("chapter", "")
                             subtop = st.get("subtopics", "")
                             lvl = st.get("level", "EXTREME_HIGH")
-                            slots = st.get("slots", ["09:00", "15:00", "21:00"])
+                            sch_date = st.get("schedule_date", datetime.now().strftime("%Y-%m-%d"))
+                            sch_time_ampm = st.get("schedule_time", "08:00 PM")
                             cnt = st.get("count", 10)
 
-                            today = datetime.now()
-                            added = 0
+                            # Parse AM/PM to 24-Hour datetime string (YYYY-MM-DD HH:MM)
+                            dt_object = datetime.strptime(f"{sch_date} {sch_time_ampm}", "%Y-%m-%d %I:%M %p")
+                            formatted_dt_str = dt_object.strftime("%Y-%m-%d %H:%M")
+
+                            scheduled_quizzes.append({
+                                "chat_id": target_grp,
+                                "datetime": formatted_dt_str,
+                                "subject": subj,
+                                "chapter": chap,
+                                "subtopics": subtop,
+                                "count": cnt,
+                                "timer": tmr,
+                                "level": lvl,
+                                "conductor_id": query_chat_id
+                            })
+
                             chap_text = chap if chap else "Full Subject Syllabus"
                             subtop_text = f"\n🎯 **Subtopics:** `{subtop}`" if subtop else ""
 
-                            for day in range(30):
-                                f_date = (today + timedelta(days=day)).strftime("%Y-%m-%d")
-                                for slot in slots:
-                                    scheduled_quizzes.append({
-                                        "chat_id": target_grp,
-                                        "datetime": f"{f_date} {slot}",
-                                        "subject": subj,
-                                        "chapter": chap,
-                                        "subtopics": subtop,
-                                        "count": cnt,
-                                        "timer": tmr,
-                                        "level": lvl,
-                                        "conductor_id": query_chat_id
-                                    })
-                                    added += 1
-
-                            # ANNOUNCEMENT IN GROUP
+                            # Announcement in Group
                             announcement_text = (
                                 f"📢 **SCHEDULED QUIZ ANNOUNCEMENT**\n"
                                 f"─────────────────────\n"
                                 f"📘 **Subject:** `{subj}`\n"
                                 f"📖 **Scope:** `{chap_text}`{subtop_text}\n"
-                                f"⏰ **Daily Time Slots:** `{', '.join(slots)}`\n"
-                                f"🔢 **Questions/Quiz:** `{cnt}` | ⏱️ **Timer:** `{tmr}s`\n"
+                                f"📅 **Date:** `{sch_date}`\n"
+                                f"⏰ **Time:** `{sch_time_ampm}`\n"
+                                f"🔢 **Questions:** `{cnt}` | ⏱️ **Timer:** `{tmr}s`\n"
                                 f"─────────────────────\n"
-                                f"📌 *Quizzes will start automatically at scheduled times!*"
+                                f"📌 *Quiz will start automatically at the scheduled time!*"
                             )
                             res_msg = send_message(target_grp, announcement_text)
                             if res_msg.get("ok"):
                                 pin_message(target_grp, res_msg["result"]["message_id"])
 
-                            edit_message(query_chat_id, message_id, f"🎉 **Schedule Created & Announced!**\n\n📌 Group ID: `{target_grp}`\n📘 Subject: `{subj}` (`{chap_text}`)\n⏰ Slots: `{', '.join(slots)}`\n\n_Group announcement pinned successfully!_")
+                            edit_message(
+                                query_chat_id, 
+                                message_id, 
+                                f"🎉 **Schedule Created & Announced!**\n\n"
+                                f"📌 Group ID: `{target_grp}`\n"
+                                f"📘 Subject: `{subj}` (`{chap_text}`)\n"
+                                f"📅 Date: `{sch_date}`\n"
+                                f"⏰ Time: `{sch_time_ampm}`\n\n"
+                                f"_Group announcement pinned successfully!_"
+                            )
 
         except Exception as e:
             time.sleep(2)
