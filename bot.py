@@ -8,6 +8,7 @@ import hashlib
 from datetime import datetime, timedelta
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 
 import database
@@ -623,7 +624,7 @@ def get_role_based_help_text(user_id):
             "┌──────────────────────────────────────\n"
             "│ 📚 **2. SMART KNOWLEDGE HUB & KEYWORDS**\n"
             "├──────────────────────────────────────\n"
-            "│ • `/addkeyword [#kw] \| [link] \| [teacher]` : Add smart material keyword\n"
+            "│ • `/addkeyword [#kw] | [link] | [teacher]` : Add smart material keyword\n"
             "│ • `/keywords` : View all smart study keywords & links\n"
             "│ • `/parse` : Parse raw text/PDF into quiz questions\n"
             "└──────────────────────────────────────\n\n"
@@ -999,7 +1000,26 @@ def handle_updates():
         except Exception as e:
             time.sleep(2)
 
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK - CA Vault Quiz Bot is running")
+    def log_message(self, format, *args):
+        return
+
+def start_health_check_server():
+    port = int(os.getenv("PORT", "10000"))
+    try:
+        server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+        print(f"Health Check HTTP Server listening on port {port} for Render deployment...")
+        server.serve_forever()
+    except Exception as e:
+        print(f"Health Check HTTP Server error: {e}")
+
 if __name__ == "__main__":
+    threading.Thread(target=start_health_check_server, daemon=True).start()
     threading.Thread(target=purge_background_worker, daemon=True).start()
     threading.Thread(target=icai_auto_sync_worker, daemon=True).start()
     threading.Thread(target=scheduler_background_worker, daemon=True).start()
