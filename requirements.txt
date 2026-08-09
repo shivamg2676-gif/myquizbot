@@ -1,5 +1,0 @@
-python-telegram-bot==20.8
-requests
-google-generativeai
-groq
-openai
