@@ -6,6 +6,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import random
 
 # --- CONFIGURATION & API KEYS FROM RENDER ENV ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -28,7 +29,55 @@ schedule_wizard_state = {}
 # Permanent mapping: user_id -> linked_group_id
 user_linked_groups = {}
 
+# System state for auto quizzes and anti-repetition tracking
+auto_quiz_announced = set()  # Tracks slots already announced today to avoid double post
+completed_auto_chapters = {} # group_id -> {subject: [used_chapters]}
+
 SUBJECTS = ["Accounts", "Business Laws", "Quantitative Aptitude", "Economics"]
+
+# --- HIGH WEIGHTAGE ICAI CHAPTERS MAPPING ---
+HIGH_WEIGHTAGE_CHAPTERS = {
+    "Accounts": [
+        "Final Accounts of Sole Proprietors",
+        "Partnership and NPO Accounts",
+        "Company Accounts (Issue of Shares & Debentures)",
+        "Bank Reconciliation Statement (BRS)",
+        "Accounting Process & Rectification of Errors",
+        "Depreciation and Inventory Valuation"
+    ],
+    "Economics": [
+        "Theory of Demand and Supply",
+        "Theory of Production and Cost",
+        "Price Determination in Different Markets",
+        "National Income Accounting",
+        "Public Finance and Money Market",
+        "Business Cycles"
+    ],
+    "Business Laws": [
+        "The Indian Contract Act, 1872",
+        "The Companies Act, 2013",
+        "The Sale of Goods Act, 1930",
+        "The Indian Partnership Act, 1932",
+        "The Limited Liability Partnership Act, 2008"
+    ],
+    "Quantitative Aptitude": [
+        "Ratio, Proportion, Indices and Logarithms",
+        "Time Value of Money (TVM)",
+        "Permutations and Combinations",
+        "Sequence and Series (AP & GP)",
+        "Measures of Central Tendency and Dispersion",
+        "Probability and Theoretical Distributions",
+        "Correlation and Regression"
+    ]
+}
+
+# --- AUTOMATED SLOTS & SUBJECT MAPPING ---
+AUTO_SLOTS = {
+    "12:00": "Accounts",
+    "15:00": "Economics",
+    "18:00": "Business Laws",
+    "21:00": "Quantitative Aptitude"
+}
 
 print("🦅 CA Vault Direct Execution Quiz Bot Starting...")
 
@@ -365,11 +414,35 @@ def run_quiz_session(target_chat_id, subject, chapter, count, timer, break_freq=
     if conductor_user_id:
         send_message(conductor_user_id, f"🎉 **Quiz Complete in Group (`{target_chat_id}`)!**\nTotal Questions Conducted: `{count}`.")
 
+# --- AUTOMATED HIGH-WEIGHTAGE ANALYSIS ENGINE ---
+
+def select_next_best_chapter(group_id, subject):
+    """Selects an unrepeated high-yield ICAI chapter for the group."""
+    if group_id not in completed_auto_chapters:
+        completed_auto_chapters[group_id] = {}
+    if subject not in completed_auto_chapters[group_id]:
+        completed_auto_chapters[group_id][subject] = []
+
+    available = [ch for ch in HIGH_WEIGHTAGE_CHAPTERS[subject] if ch not in completed_auto_chapters[group_id][subject]]
+    
+    # Reset tracking if all chapters finished once
+    if not available:
+        completed_auto_chapters[group_id][subject] = []
+        available = HIGH_WEIGHTAGE_CHAPTERS[subject]
+        
+    selected_ch = random.choice(available)
+    completed_auto_chapters[group_id][subject].append(selected_ch)
+    return selected_ch
+
 # --- BACKGROUND SCHEDULER WORKER ---
 
 def scheduler_background_worker():
     while True:
-        current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        now = datetime.now()
+        current_time_str = now.strftime("%Y-%m-%d %H:%M")
+        time_hm = now.strftime("%H:%M")
+        
+        # 1. HANDLE MANUALLY SCHEDULED QUIZZES
         for job in list(scheduled_quizzes):
             if job["datetime"] == current_time_str:
                 threading.Thread(
@@ -389,6 +462,60 @@ def scheduler_background_worker():
                     daemon=True
                 ).start()
                 scheduled_quizzes.remove(job)
+
+        # 2. AUTOMATED BACKUP ENGINE (ANNOUNCEMENTS & AUTO RUNS)
+        active_linked_groups = list(set(user_linked_groups.values()))
+
+        for group_id in active_linked_groups:
+            # Calculate 1 Hour ahead time slot
+            one_hour_ahead = (now + timedelta(hours=1)).strftime("%H:%M")
+
+            # A. 1-HOUR PRIOR AUTO ANNOUNCEMENT
+            if one_hour_ahead in AUTO_SLOTS:
+                slot_key = f"{now.strftime('%Y-%m-%d')}_{one_hour_ahead}_{group_id}_announce"
+                if slot_key not in auto_quiz_announced:
+                    
+                    # Check if manual quiz exists for this slot
+                    manual_exists = any(
+                        q["chat_id"] == group_id and q["datetime"] == f"{now.strftime('%Y-%m-%d')} {one_hour_ahead}" 
+                        for q in scheduled_quizzes
+                    )
+                    
+                    if not manual_exists:
+                        target_subject = AUTO_SLOTS[one_hour_ahead]
+                        target_chapter = select_next_best_chapter(group_id, target_subject)
+                        
+                        # Register auto quiz job for future execution
+                        scheduled_quizzes.append({
+                            "chat_id": group_id,
+                            "datetime": f"{now.strftime('%Y-%m-%d')} {one_hour_ahead}",
+                            "subject": target_subject,
+                            "chapter": target_chapter,
+                            "subtopics": "ICAI High-Yield Focus Topics",
+                            "count": 15,
+                            "timer": 30,
+                            "level": "EXTREME_HIGH",
+                            "conductor_id": None
+                        })
+                        
+                        # Post Announcement to Group
+                        announce_msg = (
+                            f"📢 **AUTOMATED QUIZ UPCOMING IN 1 HOUR!**\n"
+                            f"─────────────────────\n"
+                            f"📊 **Analysis:** High-Yield Chapter Triggered!\n"
+                            f"📘 **Subject:** `{target_subject}`\n"
+                            f"📖 **Chapter:** `{target_chapter}`\n"
+                            f"⏰ **Time Slot:** `{one_hour_ahead}`\n"
+                            f"🔢 **Questions:** `15` | ⏱️ **Timer:** `30s`\n"
+                            f"─────────────────────\n"
+                            f"📌 *Get ready! The quiz will start automatically in 60 minutes.*"
+                        )
+                        res = send_message(group_id, announce_msg)
+                        if res.get("ok"):
+                            pin_message(group_id, res["result"]["message_id"])
+
+                        auto_quiz_announced.add(slot_key)
+
         time.sleep(15)
 
 def get_help_text():
@@ -400,8 +527,14 @@ def get_help_text():
         "• `/myid` — Check Group ID\n\n"
         "💬 **DM CONTROL WIZARD (BOT DM ONLY)**\n"
         "• `/link_group <GroupID>` — Link your group permanently\n"
-        "• `/schedule` — Step-by-Step Guided Scheduler Wizard\n"
-        "  *(Set Subject, Chapter, Sub-topics, Level, Time Slots, Qs & Timer)*"
+        "• `/schedule` — Step-by-Step Guided Scheduler Wizard\n\n"
+        "🤖 **AUTO QUIZ SCHEDULE (HIGH WEIGHTAGE)**\n"
+        "*(Runs automatically if no manual quiz set)*\n"
+        "• 12:00 PM ➔ Accounts\n"
+        "• 03:00 PM ➔ Economics\n"
+        "• 06:00 PM ➔ Business Laws\n"
+        "• 09:00 PM ➔ Quantitative Aptitude\n"
+        "*(1-Hour Advance Announcement sent & pinned automatically!)*"
     )
 
 # --- WIZARD HELPER TO BUILD SUMMARY TEXT ---
