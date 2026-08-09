@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: ca-vault-quiz-bot
+    runtime: docker
+    plan: free
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+      - key: BOT_TOKEN
+        sync: false
+      - key: WEBHOOK_URL
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: ANNOUNCEMENT_CHANNEL
+        sync: false
+      - key: DATABASE_URL
+        value: sqlite+aiosqlite:///cavault.db
+      - key: CEREBRAS_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: MISTRAL_API_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
