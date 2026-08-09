@@ -17,6 +17,7 @@ import database
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else None
 OWNER_ID = int(os.getenv("OWNER_ID", "8724204988"))
+FORCE_SUB_CHANNEL = os.getenv("FORCE_SUB_CHANNEL", "")
 MAIN_GROUP_ID = int(os.getenv("MAIN_GROUP_ID", "0"))
 
 # 6 Free AI Keys (Including OpenAI)
@@ -38,22 +39,22 @@ session_user_streaks = {}
 pinned_daily_messages = {}
 last_pinned_topper_messages = {}
 
-# System tracking for automated fallback quizzes
+# System tracking for automated backup quizzes
 auto_quiz_announced = set()
 completed_auto_chapters = {}
 
 MOTIVATIONAL_QUOTES = [
-    "🚀 *\"Pure Grindset Mode! CA Foundation rank targets on sight! No cap, pure hustle!\"*",
-    "🔥 *\"Future CA Boss Energy! Keep grinding until the suffix turns into prefix!\"*",
-    "🏛️ *\"Build your empire step by step. Today's practice = Tomorrow's Flex!\"*",
-    "💡 *\"1% better every day. Small wins turn into Legendary results!\"*",
-    "🎯 *\"Locked In & Focused. Smash those ICAI modules today!\"*"
+    "🚀 *\"Success is not final, failure is not fatal: it is the courage to continue that counts.\"* — Keep grinding CA Champ!",
+    "🔥 *\"The future depends on what you do today.\"* — Work hard for that CA prefix!",
+    "🏛️ *\"Your dedication today will build your empire tomorrow.\"* — Welcome to CA Vault!",
+    "💡 *\"Small daily improvements over time lead to stunning results.\"* — Stay focused!",
+    "🎯 *\"Believe you can and you're halfway there.\"* — Crush your CA Foundation goals!"
 ]
 
 SHAYARI_LIST = [
-    "✨ *Aag laga do questions mein, solution aisa nikalo,\nCA ki degree smartly mehnat karke apna bana lo!*",
-    "🔥 *Rukna nahi hai, jab tak safalta ka shor na ho,\nCA Foundation crack karke sabko dikha do!*",
-    "🏛️ *Raaton ka jaagna rang layega zaroor,\nPrefix mein CA lagna ab zyada nahi hai door!*"
+    "✨ *Koshish aisi karo ki har ek question solution bane,\nMehnat aisi karo ki CA ki degree tumhari pehchan bane!*",
+    "🔥 *Zindagi mein toofan aaye toh darna mat,\nCA Foundation crack karke sabko harana mat bhoolna!*",
+    "🏛️ *Subah ki mehnat aur raaton ka jaagna rang layega,\nEk din tumhare naam ke aage CA zaroor aayega!*"
 ]
 
 HIGH_WEIGHTAGE_CHAPTERS = {
@@ -105,7 +106,7 @@ SPARKLE_ROW = "✨ 💎 🔥 ⚡ 🏆 ⚡ 🔥 💎 ✨"
 def fancy_header(emoji, title):
     return f"{emoji} ░▒▓ **{title}** ▓▒░ {emoji}"
 
-print("🦅 CA Vault Ultra-Aesthetic Master OS Starting...")
+print("🦅 CA Vault Ultra-Aesthetic Master OS Starting (Fully Production Audited)...")
 
 # --- TELEGRAM API HELPER FUNCTIONS ---
 
@@ -184,6 +185,19 @@ def set_chat_permissions(chat_id, can_send_messages=True):
         return res.json().get("ok", False)
     except Exception:
         return False
+
+def check_force_sub(user_id):
+    if not FORCE_SUB_CHANNEL or not BASE_URL:
+        return True
+    try:
+        res = requests.get(f"{BASE_URL}/getChatMember", params={"chat_id": FORCE_SUB_CHANNEL, "user_id": user_id}, timeout=8)
+        data = res.json()
+        if data.get("ok"):
+            status = data["result"]["status"]
+            return status in ["creator", "administrator", "member"]
+    except Exception:
+        return True
+    return False
 
 def is_group_chat(chat_id):
     return str(chat_id).startswith("-")
@@ -418,6 +432,30 @@ def parse_ai_json_or_text_output(text, subject):
         "explanation": explanation,
         "type": "theory"
     }
+
+def parse_raw_text_questions(raw_text):
+    questions = []
+    blocks = raw_text.split("Q:")
+    for b in blocks:
+        if not b.strip(): continue
+        lines = [l.strip() for l in b.split("\n") if l.strip()]
+        q_text = lines[0] if lines else "Sample Question"
+        opts = []
+        corr = 0
+        expl = "Standard ICAI rule."
+        for line in lines:
+            if line.startswith("A)") or line.startswith("1)") or line.startswith("O1:"): opts.append(line[2:].strip())
+            elif line.startswith("B)") or line.startswith("2)") or line.startswith("O2:"): opts.append(line[2:].strip())
+            elif line.startswith("C)") or line.startswith("3)") or line.startswith("O3:"): opts.append(line[2:].strip())
+            elif line.startswith("D)") or line.startswith("4)") or line.startswith("O4:"): opts.append(line[2:].strip())
+            elif "Ans:" in line or "Correct:" in line:
+                digits = ''.join(filter(str.isdigit, line))
+                if digits: corr = int(digits) - 1
+            elif "Exp:" in line or "Explanation:" in line:
+                expl = line.split(":", 1)[1].strip()
+        if q_text and len(opts) >= 4:
+            questions.append({"question": q_text, "options": opts[:4], "correct": max(0, min(corr, 3)), "explanation": expl, "type": "theory"})
+    return questions
 
 def send_poll(chat_id, question, options, correct_option_id, open_period=30, subject=""):
     payload = {
@@ -672,7 +710,10 @@ def scheduler_background_worker():
                     if sched["is_mega_quiz"]:
                         threading.Thread(target=run_sunday_mega_quiz, args=(target_chat,), daemon=True).start()
                     else:
-                        threading.Thread(target=run_quiz_session, args=(target_chat, sched["subject"], sched["chapter_name"], 20, 25), daemon=True).start()
+                        def_cnt = int(database.get_setting("default_q_count", "15"))
+                        def_tmr = int(database.get_setting("default_timer", "30"))
+                        def_lvl = database.get_setting("default_level", "EXTREME_HIGH")
+                        threading.Thread(target=run_quiz_session, args=(target_chat, sched["subject"], sched["chapter_name"], def_cnt, def_tmr, 0, 0, def_lvl), daemon=True).start()
 
             for job in list(scheduled_quizzes):
                 if job["datetime"] == time_full:
@@ -700,35 +741,42 @@ def scheduler_background_worker():
                     threading.Thread(target=run_quiz_session, args=(job["chat_id"], job["subject"], job["chapter"], job["count"], job["timer"], job.get("break_freq", 0), job.get("break_duration", 0), job.get("level", "EXTREME_HIGH")), daemon=True).start()
                     database.delete_scheduled_quiz(job["id"])
 
-            # --- AUTOMATED BACKUP ENGINE (12 PM, 3 PM, 6 PM, 9 PM) ---
+            # --- AUTOMATED BACKUP ENGINE WITH 1-HOUR ADVANCE ANNOUNCEMENTS ---
             active_target_groups = database.get_all_linked_groups()
             if MAIN_GROUP_ID and MAIN_GROUP_ID not in active_target_groups:
                 active_target_groups.append(MAIN_GROUP_ID)
 
-            one_hour_ahead = (now + timedelta(hours=1)).strftime("%H:%M")
+            one_hour_ahead_dt = now + timedelta(hours=1)
+            one_hour_ahead_str = one_hour_ahead_dt.strftime("%H:%M")
+            one_hour_ahead_date = one_hour_ahead_dt.strftime("%Y-%m-%d")
+            one_hour_ahead_full = f"{one_hour_ahead_date} {one_hour_ahead_str}"
 
             for group_id in active_target_groups:
                 if not group_id: continue
-                if one_hour_ahead in AUTO_SLOTS:
-                    slot_key = f"{today_str}_{one_hour_ahead}_{group_id}_announce"
+                if one_hour_ahead_str in AUTO_SLOTS:
+                    slot_key = f"{one_hour_ahead_date}_{one_hour_ahead_str}_{group_id}_announce"
                     if slot_key not in auto_quiz_announced:
                         manual_exists = any(
-                            q["chat_id"] == group_id and q["datetime"] == f"{today_str} {one_hour_ahead}"
+                            q["chat_id"] == group_id and q["datetime"] == one_hour_ahead_full
                             for q in scheduled_quizzes
                         )
                         if not manual_exists:
-                            target_subject = AUTO_SLOTS[one_hour_ahead]
+                            target_subject = AUTO_SLOTS[one_hour_ahead_str]
                             target_chapter = select_next_best_chapter(group_id, target_subject)
+                            
+                            def_cnt = int(database.get_setting("default_q_count", "15"))
+                            def_tmr = int(database.get_setting("default_timer", "30"))
+                            def_lvl = database.get_setting("default_level", "EXTREME_HIGH")
 
                             scheduled_quizzes.append({
                                 "chat_id": group_id,
-                                "datetime": f"{today_str} {one_hour_ahead}",
+                                "datetime": one_hour_ahead_full,
                                 "subject": target_subject,
                                 "chapter": target_chapter,
                                 "subtopics": "ICAI High-Yield Focus Topics",
-                                "count": 15,
-                                "timer": 30,
-                                "level": "EXTREME_HIGH",
+                                "count": def_cnt,
+                                "timer": def_tmr,
+                                "level": def_lvl,
                                 "conductor_id": None
                             })
 
@@ -738,8 +786,8 @@ def scheduler_background_worker():
                                 f"📊 **Analysis:** High-Yield Chapter Triggered!\n"
                                 f"📘 **Subject:** `{target_subject}`\n"
                                 f"📖 **Chapter:** `{target_chapter}`\n"
-                                f"⏰ **Time Slot:** `{one_hour_ahead}`\n"
-                                f"🔢 **Questions:** `15` | ⏱️ **Timer:** `30s`\n"
+                                f"⏰ **Scheduled Time:** `{one_hour_ahead_str}`\n"
+                                f"🔢 **Questions:** `{def_cnt}` | ⏱️ **Timer:** `{def_tmr}s` | 🔥 **Difficulty:** `{def_lvl}`\n"
                                 f"─────────────────────\n"
                                 f"📌 *Get ready! The quiz will start automatically in 60 minutes.*"
                             )
@@ -795,7 +843,9 @@ def get_role_based_help_text(user_id):
             "• `/dashboard` or `/panel` : Launch Control Panel\n"
             "• `/setmode [auto/manual]` : Toggle Autopilot Mode\n"
             "• `/settime [HH:MM]` : Set Daily Quiz Window\n"
-            "• `/settimer [seconds]` : Dynamic Live Timer Override\n\n"
+            "• `/settimer [seconds]` : Dynamic Live Timer Override\n"
+            "• `/setcount [number]` : Set Default Question Count\n"
+            "• `/setlevel [MEDIUM/HIGH/EXTREME_HIGH]` : Override Level\n\n"
             "💬 **2. DM CONTROL WIZARD & SCHEDULER**\n"
             "• `/link_group <GroupID>` : Connect Target Group (one-time — remembered forever)\n"
             "• `/schedule` : Interactive Step-by-Step Wizard\n"
@@ -1007,11 +1057,13 @@ def handle_updates():
                                 send_message(OWNER_ID, f"📥 **NEW MATERIAL FOR APPROVAL!**\n\n📄 File: `{file_name}`\n👤 Contributor: {first_name} (`{user_id}`)\n🆔 Approval ID: `#{app_id}`", reply_markup=app_kb)
                                 send_message(chat_id, f"✅ **Material Received!** Submitted to Admin for approval.")
 
+                        # Targeted Moderation Engine
                         if is_group_chat(chat_id) and get_role(user_id) not in ["owner", "admin"]:
                             if "sticker" in message and database.get_setting("block_stickers", "on") == "on":
                                 delete_message(chat_id, message_id)
                                 warn_c, is_p = database.add_user_warning(user_id, "Inappropriate sticker")
-                                restrict_chat_member(chat_id, user_id, until_date=int((datetime.now() + timedelta(hours=24)).timestamp()) if not is_p else None)
+                                mute_time = int((datetime.now() + timedelta(hours=24)).timestamp()) if not is_p else None
+                                restrict_chat_member(chat_id, user_id, until_date=mute_time)
                                 send_message(OWNER_ID, f"🛡️ **MODERATION ALERT**: Muted {first_name} (@{username}) for sticker. Strike #{warn_c}.")
                                 continue
 
@@ -1019,7 +1071,8 @@ def handle_updates():
                             if any(w in text.lower() for w in bad_words if w):
                                 delete_message(chat_id, message_id)
                                 warn_c, is_p = database.add_user_warning(user_id, "Abusive/Spam words")
-                                restrict_chat_member(chat_id, user_id, until_date=int((datetime.now() + timedelta(hours=24)).timestamp()) if not is_p else None)
+                                mute_time = int((datetime.now() + timedelta(hours=24)).timestamp()) if not is_p else None
+                                restrict_chat_member(chat_id, user_id, until_date=mute_time)
                                 send_message(OWNER_ID, f"🛡️ **MODERATION ALERT**: Muted {first_name} (@{username}) for abusive text. Strike #{warn_c}.")
                                 continue
 
@@ -1033,7 +1086,25 @@ def handle_updates():
                             send_message(chat_id, f"📚 **CA Vault Study Material Found!**\nTeacher/Module: `{matched_kw['teacher_name'] or matched_kw['keyword']}`", reply_markup=redirect_kb)
 
                         # Commands Processing
-                        if text.startswith("/setschedule"):
+                        if text.startswith("/setcount"):
+                            if get_role(user_id) in ["owner", "admin"]:
+                                try:
+                                    cnt_val = int(text.replace("/setcount", "").strip())
+                                    database.set_setting("default_q_count", str(cnt_val))
+                                    send_message(chat_id, f"✅ **Default Question Count Updated!** Set to `{cnt_val}` Qs.")
+                                except ValueError:
+                                    send_message(chat_id, "⚠️ Usage: `/setcount 20`")
+
+                        elif text.startswith("/setlevel"):
+                            if get_role(user_id) in ["owner", "admin"]:
+                                lvl_val = text.replace("/setlevel", "").strip().upper()
+                                if lvl_val in ["MEDIUM", "HIGH", "EXTREME_HIGH"]:
+                                    database.set_setting("default_level", lvl_val)
+                                    send_message(chat_id, f"✅ **Default Difficulty Level Updated!** Set to `{lvl_val}`.")
+                                else:
+                                    send_message(chat_id, "⚠️ Usage: `/setlevel MEDIUM` or `/setlevel HIGH` or `/setlevel EXTREME_HIGH`")
+
+                        elif text.startswith("/setschedule"):
                             if user_id in schedule_wizard_state:
                                 raw_val = text.replace("/setschedule", "").strip()
                                 if "|" in raw_val:
@@ -1200,6 +1271,7 @@ def handle_updates():
                                 try:
                                     sec = int(text.replace("/settimer", "").replace("s", "").strip())
                                     active_quiz_session_timers[chat_id] = sec
+                                    database.set_setting("default_timer", str(sec))
                                     send_message(chat_id, f"⏱️ **Live Quiz Timer Updated!** Running at `{sec}s` per question.")
                                 except ValueError:
                                     send_message(chat_id, "⚠️ Usage: `/settimer 30` (in seconds)")
@@ -1276,7 +1348,9 @@ def handle_updates():
 
                             resolve_target_group(user_id, chat_id)
 
-                            quiz_builder_state[chat_id] = {"subject": "Accounts", "chapter": "", "level": "EXTREME_HIGH", "break_freq": 0, "break_duration": 0, "conductor_id": user_id}
+                            def_cnt = int(database.get_setting("default_q_count", "15"))
+                            def_lvl = database.get_setting("default_level", "EXTREME_HIGH")
+                            quiz_builder_state[chat_id] = {"subject": "Accounts", "chapter": "", "level": def_lvl, "count": def_cnt, "break_freq": 0, "break_duration": 0, "conductor_id": user_id}
                             keyboard = {
                                 "inline_keyboard": [
                                     [{"text": "📊 Accounts", "callback_data": "sub_Accounts"}],
@@ -1329,7 +1403,10 @@ def handle_updates():
                                 edit_message(query_chat_id, message_id, "⚠️ **No Group Linked!**\nPehle DM mein `/link_group <GroupId>` bhej kar group link karein.", reply_markup={"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "ui_home"}]]})
                             else:
                                 edit_message(query_chat_id, message_id, f"🚀 **Session Dispatched!**\nQuiz running live in Target Group (`{target_grp}`).", reply_markup={"inline_keyboard": [[{"text": "🔙 Back", "callback_data": "ui_home"}]]})
-                                threading.Thread(target=run_quiz_session, args=(target_grp, "Accounts", "", 5, 20, 0, 0, "EXTREME_HIGH", user_id), daemon=True).start()
+                                def_cnt = int(database.get_setting("default_q_count", "15"))
+                                def_tmr = int(database.get_setting("default_timer", "30"))
+                                def_lvl = database.get_setting("default_level", "EXTREME_HIGH")
+                                threading.Thread(target=run_quiz_session, args=(target_grp, "Accounts", "", def_cnt, def_tmr, 0, 0, def_lvl, user_id), daemon=True).start()
 
                         elif data_cb == "ui_schedule_wizard":
                             target_grp = resolve_target_group(user_id, query_chat_id)
@@ -1452,7 +1529,7 @@ def handle_updates():
                             subj = state.get("subject", "Accounts")
                             chap = state.get("chapter", "")
                             subtop = state.get("subtopics", "")
-                            cnt = state.get("count", 10)
+                            cnt = state.get("count", 15)
                             bf = state.get("break_freq", 0)
                             bd = state.get("break_duration", 0)
                             lvl = state.get("level", "EXTREME_HIGH")
@@ -1536,7 +1613,7 @@ def handle_updates():
                             lvl = st.get("level", "EXTREME_HIGH")
                             sch_date = st.get("schedule_date", datetime.now().strftime("%Y-%m-%d"))
                             sch_time_ampm = st.get("schedule_time", "08:00 PM")
-                            cnt = st.get("count", 10)
+                            cnt = st.get("count", 15)
 
                             dt_object = datetime.strptime(f"{sch_date} {sch_time_ampm}", "%Y-%m-%d %I:%M %p")
                             formatted_dt_str = dt_object.strftime("%Y-%m-%d %H:%M")
@@ -1611,7 +1688,7 @@ def handle_updates():
                                 edit_message(query_chat_id, message_id, f"❌ Rejected quiz request for user `{target_u}`.")
 
                         elif data_cb == "dash_settings":
-                            edit_message(query_chat_id, message_id, "⚙️ **SYSTEM SETTINGS**\n\n• Mode: `AUTO`\n• Dynamic Timers: `25s - 45s`", reply_markup=build_dashboard_keyboard())
+                            edit_message(query_chat_id, message_id, "⚙️ **SYSTEM SETTINGS**\n\n• Mode: `AUTO`\n• Stickers Auto-Block: `ON`\n• Dynamic Timers: `25s - 45s`", reply_markup=build_dashboard_keyboard())
 
                         elif data_cb == "dash_mod":
                             edit_message(query_chat_id, message_id, "🛡️ **MODERATION CONTROL PANEL**\n\nUse `/filter add [word]` or `/stickers [on|off]` to control auto-purging filters.", reply_markup=build_dashboard_keyboard())
