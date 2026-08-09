@@ -1,4 +1,3 @@
-import asyncio
 import logging
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -79,9 +78,29 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_health(request):
     return web.Response(text="CA Vault Bot is running live 24/7!")
 
+# --- Async Lifecycle Hook (Initializes DB & Web Server cleanly inside PTB Loop) ---
+async def post_init(app: Application):
+    # 1. Database Initialize
+    await database.init_db()
+    logging.info("Database initialized successfully.")
+
+    # 2. Start Aiohttp Server for Render 24/7 Ping
+    web_app = web.Application()
+    web_app.router.add_get("/", handle_health)
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", config.PORT)
+    await site.start()
+    logging.info(f"Health check server running on port {config.PORT}")
+
 def main():
-    # Initialize Application
-    app = Application.builder().token(config.BOT_TOKEN).build()
+    # Build Application with post_init Hook
+    app = (
+        Application.builder()
+        .token(config.BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     # Register Handlers
     app.add_handler(CommandHandler("start", start_cmd))
@@ -92,21 +111,9 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_messages))
     app.add_handler(PollAnswerHandler(quiz_engine.quiz_engine.handle_poll_answer))
 
-    # Initialize Database Async
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(database.init_db())
-
-    # Start Aiohttp Web Server alongside Bot Polling for Render Health Check
-    web_app = web.Application()
-    web_app.router.add_get("/", handle_health)
-    runner = web.AppRunner(web_app)
-    loop.run_until_complete(runner.setup())
-    site = web.TCPSite(runner, "0.0.0.0", config.PORT)
-    loop.run_until_complete(site.start())
-
-    logging.info(f"Health check server running on port {config.PORT}")
     logging.info("Starting Telegram Bot Polling...")
     app.run_polling()
 
 if __name__ == "__main__":
     main()
+    
