@@ -31,6 +31,12 @@ def init_db():
         )
     """)
     
+    # Check for linked_group_id column migration
+    cursor.execute("PRAGMA table_info(users)")
+    columns = [col["name"] for col in cursor.fetchall()]
+    if "linked_group_id" not in columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN linked_group_id INTEGER")
+
     # 2. Quiz History Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS quiz_history (
@@ -199,11 +205,14 @@ def init_db():
         )
     """)
 
-    # Default seeds
+    # Default settings seed
     cursor.execute("INSERT OR IGNORE INTO bot_settings (setting_key, setting_val) VALUES ('mode', 'auto')")
     cursor.execute("INSERT OR IGNORE INTO bot_settings (setting_key, setting_val) VALUES ('default_time', '19:00')")
     cursor.execute("INSERT OR IGNORE INTO bot_settings (setting_key, setting_val) VALUES ('block_stickers', 'on')")
-    
+    cursor.execute("INSERT OR IGNORE INTO bot_settings (setting_key, setting_val) VALUES ('default_q_count', '15')")
+    cursor.execute("INSERT OR IGNORE INTO bot_settings (setting_key, setting_val) VALUES ('default_timer', '30')")
+    cursor.execute("INSERT OR IGNORE INTO bot_settings (setting_key, setting_val) VALUES ('default_level', 'EXTREME_HIGH')")
+
     conn.commit()
     conn.close()
 
