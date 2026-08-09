@@ -105,7 +105,7 @@ SPARKLE_ROW = "✨ 💎 🔥 ⚡ 🏆 ⚡ 🔥 💎 ✨"
 def fancy_header(emoji, title):
     return f"{emoji} ░▒▓ **{title}** ▓▒░ {emoji}"
 
-print("🦅 CA Vault Ultra-Aesthetic Master OS Starting (Fully Audited Production Build)...")
+print("🦅 CA Vault Ultra-Aesthetic Master OS Starting...")
 
 # --- TELEGRAM API HELPER FUNCTIONS ---
 
@@ -419,30 +419,6 @@ def parse_ai_json_or_text_output(text, subject):
         "type": "theory"
     }
 
-def parse_raw_text_questions(raw_text):
-    questions = []
-    blocks = raw_text.split("Q:")
-    for b in blocks:
-        if not b.strip(): continue
-        lines = [l.strip() for l in b.split("\n") if l.strip()]
-        q_text = lines[0] if lines else "Sample Question"
-        opts = []
-        corr = 0
-        expl = "Standard ICAI rule."
-        for line in lines:
-            if line.startswith("A)") or line.startswith("1)") or line.startswith("O1:"): opts.append(line[2:].strip())
-            elif line.startswith("B)") or line.startswith("2)") or line.startswith("O2:"): opts.append(line[2:].strip())
-            elif line.startswith("C)") or line.startswith("3)") or line.startswith("O3:"): opts.append(line[2:].strip())
-            elif line.startswith("D)") or line.startswith("4)") or line.startswith("O4:"): opts.append(line[2:].strip())
-            elif "Ans:" in line or "Correct:" in line:
-                digits = ''.join(filter(str.isdigit, line))
-                if digits: corr = int(digits) - 1
-            elif "Exp:" in line or "Explanation:" in line:
-                expl = line.split(":", 1)[1].strip()
-        if q_text and len(opts) >= 4:
-            questions.append({"question": q_text, "options": opts[:4], "correct": max(0, min(corr, 3)), "explanation": expl, "type": "theory"})
-    return questions
-
 def send_poll(chat_id, question, options, correct_option_id, open_period=30, subject=""):
     payload = {
         "chat_id": chat_id,
@@ -625,7 +601,7 @@ def run_sunday_mega_quiz(target_chat_id):
             time.sleep(600)
         run_quiz_session(target_chat_id, f"SUNDAY MEGA: {s['subject']}", "", s['count'], 25, level="EXTREME_HIGH")
 
-# --- BACKGROUND WORKERS (PURGE, SCHEDULER & AUTOMATED BACKUP) ---
+# --- BACKGROUND WORKERS ---
 
 def select_next_best_chapter(group_id, subject):
     if group_id not in completed_auto_chapters:
@@ -725,7 +701,7 @@ def scheduler_background_worker():
                     database.delete_scheduled_quiz(job["id"])
 
             # --- AUTOMATED BACKUP ENGINE (12 PM, 3 PM, 6 PM, 9 PM) ---
-            active_target_groups = database.get_all_linked_groups() if hasattr(database, "get_all_linked_groups") else []
+            active_target_groups = database.get_all_linked_groups()
             if MAIN_GROUP_ID and MAIN_GROUP_ID not in active_target_groups:
                 active_target_groups.append(MAIN_GROUP_ID)
 
@@ -1635,7 +1611,7 @@ def handle_updates():
                                 edit_message(query_chat_id, message_id, f"❌ Rejected quiz request for user `{target_u}`.")
 
                         elif data_cb == "dash_settings":
-                            edit_message(query_chat_id, message_id, "⚙️ **SYSTEM SETTINGS**\n\n• Mode: `AUTO`\n• Stickers Auto-Block: `ON`\n• Dynamic Timers: `25s - 45s`", reply_markup=build_dashboard_keyboard())
+                            edit_message(query_chat_id, message_id, "⚙️ **SYSTEM SETTINGS**\n\n• Mode: `AUTO`\n• Dynamic Timers: `25s - 45s`", reply_markup=build_dashboard_keyboard())
 
                         elif data_cb == "dash_mod":
                             edit_message(query_chat_id, message_id, "🛡️ **MODERATION CONTROL PANEL**\n\nUse `/filter add [word]` or `/stickers [on|off]` to control auto-purging filters.", reply_markup=build_dashboard_keyboard())
