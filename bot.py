@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
